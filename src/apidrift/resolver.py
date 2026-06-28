@@ -177,11 +177,16 @@ def _register(
 
 
 def _reassigned_names(tree: ast.Module) -> set[str]:
-    """Names that are assigned, looped, or bound as a parameter anywhere.
+    """Names that are assigned, looped, bound as a parameter, or defined anywhere.
 
     Import statements do not produce ``Store`` ``Name`` nodes, so an imported alias
     only appears here if the code rebinds it — in which case its target is no longer
-    trustworthy and we drop it.
+    trustworthy and we drop it. ``def``, ``async def`` and ``class`` bind their name
+    via the node's ``.name`` string (no ``Store`` ``Name`` node either), so they must
+    be collected explicitly — otherwise a local ``def read_csv(...)`` would shadow
+    ``from pandas import read_csv`` and the resolver would wrongly target
+    ``pandas.read_csv`` on the user's own function. Whole-module scope is fine:
+    over-dropping only costs recall, never soundness.
     """
     assigned: set[str] = set()
     for node in ast.walk(tree):
@@ -189,6 +194,8 @@ def _reassigned_names(tree: ast.Module) -> set[str]:
             assigned.add(node.id)
         elif isinstance(node, ast.arg):
             assigned.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            assigned.add(node.name)
     return assigned
 
 

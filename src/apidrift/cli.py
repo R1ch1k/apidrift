@@ -1,20 +1,23 @@
 """Command-line entry point.
 
-M0 surface: resolve and print third-party call targets. There are no checks yet —
-this milestone exists to prove resolution is correct before any existence/kwargs
-logic is layered on. Output formatting is intentionally minimal and will move to
-``report.py`` at M3.
+M1 surface: resolve each file, run Check A (symbol existence) against the installed
+packages, and print the diagnostics + the pitch summary. Exit 1 if any drift is
+found, 0 if clean — so a single line gates CI.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
+import io
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from apidrift import __version__
+from apidrift.checks import Violation, check_existence
+from apidrift.report import render_report
 from apidrift.resolver import FileResolution, resolve_file
 
 _GLOB_CHARS = "*?["
@@ -36,40 +39,31 @@ def collect_python_files(paths: Sequence[str]) -> list[Path]:
             candidates = sorted(path.rglob("*.py")) if path.is_dir() else [path]
 
         for candidate in candidates:
-            if candidate.suffix == ".py" and candidate not in seen:
+            if candidate.suffix == ".py" and candidate.is_file() and candidate not in seen:
                 seen.add(candidate)
                 files.append(candidate)
 
     return files
 
 
-def _print_file(resolution: FileResolution, *, verbose: bool) -> int:
-    """Print one file's resolved targets; return the count of resolved calls."""
-    if resolution.syntax_error is not None:
-        print(f"{resolution.path}: skipped (syntax error: {resolution.syntax_error.msg})")
-        return 0
+def _check(resolution: FileResolution) -> list[Violation]:
+    return [v for v in (check_existence(c) for c in resolution.resolved) if v is not None]
 
-    for call in sorted(resolution.resolved, key=lambda c: (c.lineno, c.col_offset)):
-        print(f"{resolution.path}:{call.lineno}   {call.fqname}")
 
-    if verbose:
-        for skip in sorted(resolution.skipped, key=lambda c: (c.lineno, c.col_offset)):
-            print(
-                f"{resolution.path}:{skip.lineno}   - skipped {skip.display}  "
-                f"({skip.reason.value})"
-            )
-        for module in resolution.import_table.wildcard_modules:
-            print(f"{resolution.path}: note - wildcard import 'from {module} import *'")
-
-    return len(resolution.resolved)
+def _configure_utf8() -> None:
+    """Best-effort UTF-8 stdout/stderr so box-drawing diagnostics survive on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            with contextlib.suppress(ValueError, OSError):
+                stream.reconfigure(encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apidrift",
         description=(
-            "Flag API calls that drifted from the installed dependency version. "
-            "(M0: resolution only — prints the call targets apidrift can resolve.)"
+            "Flag API calls that drifted from the installed dependency version "
+            "(Check A: symbol existence)."
         ),
     )
     parser.add_argument(
@@ -82,13 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-v",
         "--verbose",
         action="store_true",
-        help="Show calls that were skipped, and why (trust-building).",
+        help="Also report calls skipped as unresolvable, and why (trust-building).",
     )
     parser.add_argument("--version", action="version", version=f"apidrift {__version__}")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_utf8()
     args = build_parser().parse_args(argv)
 
     files = collect_python_files(args.paths)
@@ -96,14 +91,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("apidrift: no Python files found in the given paths", file=sys.stderr)
         return 2
 
-    total_resolved = 0
-    for path in files:
-        total_resolved += _print_file(resolve_file(path), verbose=args.verbose)
+    per_file: list[tuple[str, Sequence[Violation]]] = []
+    total_checked = 0
+    total_skipped = 0
+    verbose_lines: list[str] = []
 
-    print()
-    print(f"{total_resolved} resolved call target(s) across {len(files)} file(s)")
-    print("M0 walking skeleton - resolution only, no checks yet.")
-    return 0
+    for path in files:
+        resolution = resolve_file(path)
+        if resolution.syntax_error is not None:
+            if args.verbose:
+                verbose_lines.append(
+                    f"{resolution.path}: skipped file (syntax error: {resolution.syntax_error.msg})"
+                )
+            continue
+
+        per_file.append((resolution.path, _check(resolution)))
+        total_checked += len(resolution.resolved)
+        total_skipped += len(resolution.skipped)
+
+        if args.verbose:
+            for skip in sorted(resolution.skipped, key=lambda s: (s.lineno, s.col_offset)):
+                verbose_lines.append(
+                    f"{resolution.path}:{skip.lineno}   - skipped {skip.display}  "
+                    f"({skip.reason.value})"
+                )
+
+    print(render_report(per_file))
+
+    if args.verbose:
+        print()
+        print(f"checked {total_checked} resolved target(s) against installed packages")
+        if verbose_lines:
+            print(f"{total_skipped} call(s) skipped as unresolvable:")
+            for line in verbose_lines:
+                print(f"  {line}")
+
+    total_violations = sum(len(violations) for _, violations in per_file)
+    return 1 if total_violations else 0
 
 
 if __name__ == "__main__":

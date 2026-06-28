@@ -142,6 +142,39 @@ def test_ambiguous_import_is_dropped() -> None:
     assert _fqnames(source) == set()
 
 
+def test_function_def_shadow_is_dropped() -> None:
+    # A local `def read_csv` shadows the import. There is NO Store Name node for a
+    # def, so without explicit handling this slips through and the resolver would
+    # wrongly target pandas.read_csv on the user's own function (a false positive).
+    source = (
+        "from pandas import read_csv\n"
+        "def read_csv(path):\n"
+        "    return path\n"
+        "read_csv('x')\n"
+    )
+    assert _fqnames(source) == set()
+
+
+def test_async_function_def_shadow_is_dropped() -> None:
+    source = (
+        "from pandas import read_csv\n"
+        "async def read_csv(path):\n"
+        "    return path\n"
+        "read_csv('x')\n"
+    )
+    assert _fqnames(source) == set()
+
+
+def test_class_def_shadow_is_dropped() -> None:
+    source = (
+        "from pandas import read_csv\n"
+        "class read_csv:\n"
+        "    pass\n"
+        "read_csv()\n"
+    )
+    assert _fqnames(source) == set()
+
+
 def test_wildcard_bare_name_is_refused() -> None:
     source = "from pandas import *\nread_exel('x')\n"
     assert _fqnames(source) == set()

@@ -10,18 +10,28 @@ major version. A type-checker reads stubs and can miss this; apidrift checks
 
 ```text
 $ apidrift examples/ai_generated.py
-examples/ai_generated.py:16  ERROR  openai.ChatCompletion missing in openai 1.x
-   └─ removed in openai>=1.0 · did you mean: openai.chat.completions?
-examples/ai_generated.py:19  ERROR  pandas.read_csv() unexpected keyword 'mangle_dupe_cols'
-   └─ removed in pandas>=2.0
-examples/ai_generated.py:22  ERROR  pandas.read_exel not found in pandas 2.2.x
-   └─ did you mean: read_excel?
+examples/ai_generated.py:17   ERROR  pandas.read_exel not found in pandas 2.3.3
+   └─ did you mean: pandas.read_excel?
+examples/ai_generated.py:20   ERROR  pandas.concatenate not found in pandas 2.3.3
+   └─ did you mean: pandas.concat?
+examples/ai_generated.py:23   ERROR  pandas.TimeGrouper not found in pandas 2.3.3
+   └─ did you mean: pandas.Grouper?
 
 3 problems · checked against your installed versions
 ```
 
-That last line is the point: apidrift is checked against *your* environment, not a
-stub set.
+Three distinct drift mechanisms — a typo, a cross-library confusion (`concatenate` is
+numpy; pandas spells it `concat`), and a symbol removed in a major version. That last
+line is the point: apidrift is checked against *your* environment, not a stub set.
+
+### What apidrift deliberately does *not* flag
+
+Precision is the whole adoption story, so silence is a feature. In the same fixture,
+`openai.ChatCompletion.create(...)` is **not** flagged: openai 1.x keeps
+`ChatCompletion` as a proxy object that still exists on attribute access and only
+raises when *called*. The symbol exists, so an existence check correctly says nothing —
+catching a call-time deprecation is a different, harder check. apidrift would rather
+miss that than risk a false alarm on a name that is genuinely present.
 
 ## The wedge vs pyright / mypy
 
@@ -43,14 +53,14 @@ your pinned versions.
 
 ## Status
 
-🚧 **Early build.** M0 (the resolution walking skeleton) is in place: apidrift parses
-a file, builds the import table, and resolves third-party call targets. The existence
-and keyword checks (M1 / M2) are next.
+🚧 **Early build.** M1 is in place: apidrift resolves third-party call targets and runs
+**Check A (symbol existence)** against the installed packages, with `difflib`
+"did-you-mean" suggestions. Exit 1 on drift, 0 when clean — one line gates CI.
+**Check B (keyword-arg validity)** is next.
 
 ```bash
-# Try the M0 resolver (resolution only — no checks yet):
 python -m apidrift examples/ai_generated.py
-python -m apidrift examples/ai_generated.py --verbose   # show what was skipped, and why
+python -m apidrift examples/ai_generated.py --verbose   # + checked / skipped counts
 ```
 
 ## Scope (v0)
