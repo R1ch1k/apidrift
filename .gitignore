@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.cache/
+
+# apidrift's own resolved-member cache (lands here from M3 onward)
+.apidrift_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local working notes / internal design docs — kept out so history is public-ready.
+# (Remove a line below to start versioning that file.)
+HANDOFF.md
+Brief.md
