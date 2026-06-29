@@ -13,12 +13,16 @@ name anchors the not-installed path.
 from __future__ import annotations
 
 import ast
+from pathlib import Path
+
+import pytest
 
 from apidrift.resolver import (
     RootKind,
     SkipReason,
     build_import_table,
     classify_root,
+    resolve_file,
     resolve_source,
 )
 
@@ -220,3 +224,61 @@ def test_locations_are_reported() -> None:
     assert call.lineno == 3
     assert call.root_package == "pandas"
     assert call.attr_path == ("read_csv",)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_file — an unreadable file is captured, NEVER raised (crash-safety).
+# A single bad file in a real tree must not abort the whole run.
+# --------------------------------------------------------------------------- #
+def test_invalid_utf8_file_is_captured_not_raised(tmp_path: Path) -> None:
+    bad = tmp_path / "bad_utf8.py"
+    bad.write_bytes(b'x = "caf\xe9"\n')  # lone 0xE9 -> invalid UTF-8
+    result = resolve_file(bad)
+    assert result.read_error is not None
+    assert "UnicodeDecodeError" in result.read_error
+    assert result.syntax_error is None
+    assert result.resolved == ()
+
+
+def test_utf16_bom_file_is_captured_not_raised(tmp_path: Path) -> None:
+    bad = tmp_path / "utf16.py"
+    bad.write_bytes("import os\nos.getcwd()\n".encode("utf-16"))  # BOM + NUL bytes
+    result = resolve_file(bad)
+    assert result.read_error is not None
+    assert "UnicodeDecodeError" in result.read_error
+    assert result.resolved == ()
+
+
+def test_missing_file_is_captured_not_raised(tmp_path: Path) -> None:
+    # A path that does not exist (e.g. it vanished mid-run) -> OSError family, captured.
+    result = resolve_file(tmp_path / "gone.py")
+    assert result.read_error is not None
+    assert result.resolved == ()
+
+
+def test_arbitrary_read_error_is_captured_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The catch is exception-agnostic, not decode-only: a permission error is captured too.
+    target = tmp_path / "locked.py"
+    target.write_text("import os\n", encoding="utf-8")
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    result = resolve_file(target)
+    assert result.read_error is not None
+    assert "PermissionError" in result.read_error
+    assert result.resolved == ()
+
+
+def test_null_byte_file_degrades_cleanly(tmp_path: Path) -> None:
+    # A NUL byte is valid UTF-8 but not valid source -> handled as a syntax error
+    # (captured), never a read_error and never a raise.
+    f = tmp_path / "nul.py"
+    f.write_bytes(b"x = 1\x00\ny = 2\n")
+    result = resolve_file(f)
+    assert result.read_error is None
+    assert result.syntax_error is not None
+    assert result.resolved == ()

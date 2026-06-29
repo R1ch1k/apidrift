@@ -97,13 +97,21 @@ class SkippedCall:
 
 @dataclass(frozen=True)
 class FileResolution:
-    """The full resolution result for one source file."""
+    """The full resolution result for one source file.
+
+    ``syntax_error`` is set when the bytes were read but were not valid Python;
+    ``read_error`` is set when the file could not even be read or decoded (a non-UTF-8 /
+    UTF-16 encoding, a vanished path, permission denied, …). Either one means "nothing to
+    check here", captured rather than raised — so a single unreadable file never aborts a
+    whole run.
+    """
 
     path: str
     resolved: tuple[ResolvedCall, ...]
     skipped: tuple[SkippedCall, ...]
     import_table: ImportTable
     syntax_error: SyntaxError | None = None
+    read_error: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -319,15 +327,29 @@ def classify_root(root_package: str) -> RootKind:
 # --------------------------------------------------------------------------- #
 # Entry points
 # --------------------------------------------------------------------------- #
+def _empty_resolution(
+    path: str,
+    *,
+    syntax_error: SyntaxError | None = None,
+    read_error: str | None = None,
+) -> FileResolution:
+    """A nothing-to-check result carrying *why* (a parse failure or a read failure)."""
+    return FileResolution(
+        path=path,
+        resolved=(),
+        skipped=(),
+        import_table=ImportTable(names={}, wildcard_modules=(), relative_names=frozenset()),
+        syntax_error=syntax_error,
+        read_error=read_error,
+    )
+
+
 def resolve_source(source: str, path: str = "<unknown>") -> FileResolution:
     """Parse and resolve a source string. Syntax errors are captured, not raised."""
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
-        empty = ImportTable(names={}, wildcard_modules=(), relative_names=frozenset())
-        return FileResolution(
-            path=path, resolved=(), skipped=(), import_table=empty, syntax_error=exc
-        )
+        return _empty_resolution(path, syntax_error=exc)
     table = build_import_table(tree)
     resolved, skipped = resolve_calls(tree, table)
     return FileResolution(
@@ -339,6 +361,17 @@ def resolve_source(source: str, path: str = "<unknown>") -> FileResolution:
 
 
 def resolve_file(path: Path) -> FileResolution:
-    """Read and resolve a file from disk."""
-    source = path.read_text(encoding="utf-8")
+    """Read and resolve a file from disk, failing safe on any read/decode error.
+
+    Reading arbitrary files in a real tree can fail many ways — a non-UTF-8 or UTF-16
+    encoding, a path that vanished mid-run, a permission-denied file, an OS-level read
+    error. None of these may crash the run: an unreadable file becomes a captured
+    ``read_error`` on the result, never a raised exception. The catch is deliberately
+    broad (not just ``UnicodeDecodeError``) — the same broad-catch-to-silent rule as the
+    introspection boundary, so the *next* unreadable-file variant cannot crash it either.
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except Exception as exc:  # deliberate fail-safe: unreadable file => captured, never raised
+        return _empty_resolution(str(path), read_error=f"{type(exc).__name__}: {exc}")
     return resolve_source(source, str(path))

@@ -131,6 +131,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for path in files:
         resolution = resolve_file(path)
+        if resolution.read_error is not None:
+            # A file we cannot read/decode is skipped, never fatal — the run continues
+            # and the good files are still scanned and reported.
+            if args.verbose:
+                verbose_lines.append(
+                    f"{resolution.path}: skipped file (unreadable: {resolution.read_error})"
+                )
+            continue
         if resolution.syntax_error is not None:
             if args.verbose:
                 verbose_lines.append(

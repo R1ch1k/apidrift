@@ -90,6 +90,33 @@ def test_clear_cache_exits_zero(
     assert "cleared introspection cache" in capsys.readouterr().out
 
 
+def test_unreadable_file_does_not_abort_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One bad-encoding file must NOT abort the run. The good file is still scanned and its
+    # finding reported; the exit code reflects the real drift, not the read failure.
+    # (bad.py sorts before good.py, so the failure is hit FIRST.)
+    (tmp_path / "good.py").write_text(
+        "import pandas as pd\npd.read_exel('x')\n", encoding="utf-8"
+    )
+    (tmp_path / "bad.py").write_bytes(b'x = "caf\xe9"\n')  # invalid UTF-8
+    code = main([str(tmp_path), "--no-cache"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "pandas.read_exel not found" in out
+
+
+def test_verbose_surfaces_unreadable_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "bad.py").write_bytes("x = 1\n".encode("utf-16"))  # UTF-16 BOM
+    code = main([str(tmp_path), "--no-cache", "--verbose"])
+    out = capsys.readouterr().out
+    assert code == 0  # no real findings; the unreadable file is a skip, not an error
+    assert "bad.py" in out
+    assert "unreadable" in out
+
+
 @pytest.mark.skipif(not _FIXTURE.exists(), reason="run from repo root")
 def test_fixture_demo_flags_four(capsys: pytest.CaptureFixture[str]) -> None:
     code = main([str(_FIXTURE)])
