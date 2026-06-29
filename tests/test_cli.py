@@ -49,6 +49,22 @@ def test_no_files_exits_two(capsys: pytest.CaptureFixture[str]) -> None:
     assert "no Python files" in capsys.readouterr().err
 
 
+def test_deprecation_notice_does_not_gate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A deprecation NOTICE is shown but must NOT change the exit code (still 0).
+    # legacy_lib is importable via tests/conftest.py's sys.path insertion.
+    target = tmp_path / "uses_legacy.py"
+    target.write_text("import legacy_lib\nlegacy_lib.deprecated_fn(1)\n", encoding="utf-8")
+    code = main([str(target)])
+    out = capsys.readouterr().out
+    assert code == 0  # notice-only run passes CI
+    assert "NOTICE" in out
+    assert "legacy_lib.deprecated_fn is deprecated" in out
+    assert "1 deprecation notice" in out
+    assert "0 problems" not in out
+
+
 @pytest.mark.skipif(not _FIXTURE.exists(), reason="run from repo root")
 def test_fixture_demo_flags_four(capsys: pytest.CaptureFixture[str]) -> None:
     code = main([str(_FIXTURE)])

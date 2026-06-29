@@ -36,7 +36,10 @@ def _phrase(violation: Violation) -> tuple[str, str | None]:
             detail = f"did you mean: {violation.suggestions[0]}?"
         return f"{violation.symbol}() unexpected keyword '{violation.token}'", detail
 
-    # Fallback (deprecation, etc.): headline is the symbol, detail is the free-form note.
+    if violation.check == "deprecation":
+        return f"{violation.symbol} is deprecated", violation.note
+
+    # Defensive fallback for any future check kind.
     return violation.symbol, violation.note
 
 
@@ -50,21 +53,34 @@ def format_violation(path: str, violation: Violation) -> list[str]:
     return lines
 
 
-def summary_line(total: int) -> str:
-    """The pitch line: count + the fact that it was checked against the live env."""
-    noun = "problem" if total == 1 else "problems"
-    return f"{total} {noun} {_DOT} checked against your installed versions"
+def summary_line(errors: int, notices: int = 0) -> str:
+    """The pitch line: counts + the fact that it was checked against the live env.
+
+    Errors and deprecation notices are counted separately — a notice is not a
+    "problem" (it does not gate CI), so lumping them would misrepresent a passing run.
+    """
+    parts: list[str] = []
+    if errors or not notices:
+        parts.append(f"{errors} {'problem' if errors == 1 else 'problems'}")
+    if notices:
+        parts.append(f"{notices} deprecation {'notice' if notices == 1 else 'notices'}")
+    parts.append("checked against your installed versions")
+    return f" {_DOT} ".join(parts)
 
 
 def render_report(per_file: Sequence[tuple[str, Sequence[Violation]]]) -> str:
     """Render all violations (in source order per file) followed by the summary."""
     out: list[str] = []
-    total = 0
+    errors = 0
+    notices = 0
     for path, violations in per_file:
         for violation in sorted(violations, key=lambda v: (v.lineno, v.col_offset)):
             out.extend(format_violation(path, violation))
-            total += 1
+            if violation.severity is Severity.ERROR:
+                errors += 1
+            else:
+                notices += 1
     if out:
         out.append("")
-    out.append(summary_line(total))
+    out.append(summary_line(errors, notices))
     return "\n".join(out)

@@ -65,10 +65,38 @@ def test_keyword_violation_with_suggestion() -> None:
     assert lines[1] == "   └─ did you mean: verbose?"
 
 
+def test_deprecation_violation_format() -> None:
+    violation = Violation(
+        check="deprecation",
+        severity=Severity.NOTICE,
+        lineno=5,
+        col_offset=0,
+        symbol="legacy_lib.deprecated_fn",
+        token="",
+        package="legacy_lib",
+        version="1.0",
+        suggestions=(),
+        note="use renamed_fn() instead",
+    )
+    lines = format_violation("f.py", violation)
+    assert lines[0] == "f.py:5   NOTICE  legacy_lib.deprecated_fn is deprecated"
+    assert lines[1] == "   └─ use renamed_fn() instead"
+
+
 def test_summary_line_pluralization() -> None:
     assert summary_line(1) == "1 problem · checked against your installed versions"
     assert summary_line(3) == "3 problems · checked against your installed versions"
     assert summary_line(0) == "0 problems · checked against your installed versions"
+
+
+def test_summary_line_with_notices() -> None:
+    # A notice is not a "problem"; a notice-only run must not say "0 problems".
+    assert summary_line(0, 1) == "1 deprecation notice · checked against your installed versions"
+    assert summary_line(0, 2) == "2 deprecation notices · checked against your installed versions"
+    assert (
+        summary_line(2, 1)
+        == "2 problems · 1 deprecation notice · checked against your installed versions"
+    )
 
 
 def test_render_report_orders_and_counts() -> None:

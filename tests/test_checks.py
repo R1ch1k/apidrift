@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 
 from apidrift import introspect, resolver
-from apidrift.checks import Severity, Violation, check_existence, check_keywords
+from apidrift.checks import (
+    Severity,
+    Violation,
+    check_deprecation,
+    check_existence,
+    check_keywords,
+)
 
 
 def _violations(source: str) -> list[Violation]:
@@ -196,3 +202,56 @@ def test_positional_only_passed_by_keyword_flags() -> None:
     source = "import legacy_lib\nlegacy_lib.positional_only(a=1, b=2, c=3)\n"
     tokens = {v.token for v in _kw_violations(source)}
     assert tokens == {"a", "b"}
+
+
+# --------------------------------------------------------------------------- #
+# Check C (PEP 702 __deprecated__ deprecation)
+# --------------------------------------------------------------------------- #
+def _deprecations(source: str) -> list[Violation]:
+    resolution = resolver.resolve_source(source)
+    out: list[Violation] = []
+    for call in resolution.resolved:
+        violation = check_deprecation(call)
+        if violation is not None:
+            out.append(violation)
+    return out
+
+
+def test_deprecated_function_flags_as_notice() -> None:
+    (violation,) = _deprecations("import legacy_lib\nlegacy_lib.deprecated_fn(1)\n")
+    assert violation.check == "deprecation"
+    assert violation.severity is Severity.NOTICE
+    assert violation.symbol == "legacy_lib.deprecated_fn"
+    assert violation.note == "use renamed_fn() instead"
+
+
+def test_deprecated_class_flags_as_notice() -> None:
+    (violation,) = _deprecations("import legacy_lib\nlegacy_lib.Old()\n")
+    assert violation.severity is Severity.NOTICE
+    assert violation.note == "Old is replaced by New"
+
+
+def test_non_deprecated_subclass_stays_silent() -> None:
+    # NotDeprecatedChild inherits __deprecated__ via getattr but NOT in its own __dict__.
+    # Reading the marker from getattr (instead of vars) would false-flag it.
+    assert _deprecations("import legacy_lib\nlegacy_lib.NotDeprecatedChild()\n") == []
+
+
+def test_runtime_warning_deprecation_stays_silent() -> None:
+    # Deprecated via a call-time DeprecationWarning, no PEP 702 marker -> not detectable.
+    assert _deprecations("import legacy_lib\nlegacy_lib.warns_at_call(1)\n") == []
+
+
+def test_docstring_deprecation_stays_silent() -> None:
+    # "deprecated" only in the docstring -> no marker -> silent (non-deterministic signal).
+    assert _deprecations("import legacy_lib\nlegacy_lib.documented_legacy(1)\n") == []
+
+
+def test_openai_proxy_is_not_deprecation_flagged() -> None:
+    # The APIRemovedInV1 proxy is not a __deprecated__ marker -> silent. No special-casing.
+    source = "import openai\nopenai.ChatCompletion.create(model='x', messages=[])\n"
+    assert _deprecations(source) == []
+
+
+def test_valid_symbol_is_not_deprecation_flagged() -> None:
+    assert _deprecations("import legacy_lib\nlegacy_lib.normal(1, 2)\n") == []

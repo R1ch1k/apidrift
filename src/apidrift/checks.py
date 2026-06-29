@@ -190,6 +190,59 @@ def _keywords(call: ResolvedCall, walk: _WalkResult) -> list[Violation]:
 
 
 # --------------------------------------------------------------------------- #
+# Check C — PEP 702 deprecation (and ONLY that)
+# --------------------------------------------------------------------------- #
+def check_deprecation(call: ResolvedCall) -> Violation | None:
+    """Flag a resolved symbol carrying a PEP 702 ``__deprecated__`` marker.
+
+    This is the entire scope of deprecation detection: exactly one signal, the
+    ``__deprecated__`` attribute set by ``warnings.deprecated`` /
+    ``typing_extensions.deprecated`` / the ``@deprecated`` decorator. Deprecations
+    expressed any other way (custom proxies, docstrings, runtime warnings, a curated
+    version database) are intentionally NOT detected — that keeps the check sound and
+    deterministic. The diagnostic is a NOTICE, never an ERROR: deprecated code still
+    works, so it must not gate CI by default.
+    """
+    return _deprecation(call, _walk(call))
+
+
+def _deprecation(call: ResolvedCall, walk: _WalkResult) -> Violation | None:
+    if walk.status is not _WalkStatus.RESOLVED:
+        return None
+    message = _deprecated_marker(walk.obj)
+    if message is None:
+        return None
+    return Violation(
+        check="deprecation",
+        severity=Severity.NOTICE,
+        lineno=call.lineno,
+        col_offset=call.col_offset,
+        symbol=call.fqname,
+        token="",
+        package=call.root_package,
+        version=package_version(call.root_package),
+        note=message or None,
+    )
+
+
+def _deprecated_marker(obj: object) -> str | None:
+    """The ``__deprecated__`` message if present in the object's OWN namespace.
+
+    Read from ``vars(obj)``, never ``getattr``: a non-deprecated subclass inherits a
+    deprecated base's ``__deprecated__`` via attribute lookup, which would be a false
+    positive. The own ``__dict__`` is exactly where the PEP 702 decorator stores it.
+    """
+    try:
+        own = vars(obj)
+    except TypeError:  # objects without a __dict__ (most C-level callables) -> silent
+        return None
+    marker = own.get("__deprecated__")
+    if marker is None:
+        return None
+    return marker if isinstance(marker, str) else ""
+
+
+# --------------------------------------------------------------------------- #
 # Aggregate — one walk, all checks
 # --------------------------------------------------------------------------- #
 def check_call(call: ResolvedCall) -> list[Violation]:
@@ -197,5 +250,9 @@ def check_call(call: ResolvedCall) -> list[Violation]:
     walk = _walk(call)
     existence = _existence(call, walk)
     if existence is not None:
-        return [existence]  # an absent symbol short-circuits: no point checking its kwargs
-    return _keywords(call, walk)
+        return [existence]  # an absent symbol short-circuits: no point checking it further
+    violations = _keywords(call, walk)
+    deprecation = _deprecation(call, walk)
+    if deprecation is not None:
+        violations.append(deprecation)
+    return violations
