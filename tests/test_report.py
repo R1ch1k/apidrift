@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from apidrift.checks import Severity, Violation
 from apidrift.report import format_violation, render_json, render_report, summary_line
@@ -138,6 +139,23 @@ def test_render_json_schema_and_summary() -> None:
     }
     assert keyword["check"] == "keyword"
     assert keyword["suggestion"] is None  # no close param name
+
+
+def test_json_path_is_forward_slashed() -> None:
+    # Machine consumers get a stable, OS-independent key: the JSON path is always
+    # forward-slashed, even where the file was discovered with a backslash separator.
+    native = os.path.join("src", "pkg", "mod.py")  # "src\\pkg\\mod.py" on Windows
+    payload = json.loads(render_json([(native, [_existence()])]))
+    (finding,) = payload["findings"]
+    assert finding["path"] == "src/pkg/mod.py"
+    assert "\\" not in finding["path"]
+
+
+def test_text_path_keeps_native_separator() -> None:
+    # The human-facing text report leaves the platform-native separator untouched.
+    native = os.path.join("src", "pkg", "mod.py")
+    lines = format_violation(native, _existence())
+    assert lines[0].startswith(f"{native}:11")
 
 
 def test_render_json_notice_exits_zero() -> None:

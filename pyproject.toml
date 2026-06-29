@@ -28,13 +28,17 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["ruff", "mypy", "pytest"]
+# Pinned libraries the benchmark-validation set (tests/test_benchmark.py) was verified
+# against; install with `pip install -e .[bench]` to reproduce the validated case count.
+bench = ["pandas==2.3.3", "scikit-learn==1.8.0"]
 
 [project.scripts]
 apidrift = "apidrift.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/richikmandal/apidrift"
-Repository = "https://github.com/richikmandal/apidrift"
+Homepage = "https://github.com/R1ch1k/apidrift"
+Repository = "https://github.com/R1ch1k/apidrift"
+Issues = "https://github.com/R1ch1k/apidrift/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apidrift"]

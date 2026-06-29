@@ -108,6 +108,7 @@ apidrift src --json
 
 | field | meaning |
 | --- | --- |
+| `path` | source file, always forward-slashed (OS-independent; the text report keeps native separators) |
 | `severity` | `ERROR` (gates CI) or `NOTICE` (deprecation; does not gate) |
 | `check` | `existence`, `keyword`, or `deprecation` |
 | `symbol` | the fully-qualified target the finding is about |
@@ -219,9 +220,18 @@ against third-party packages installed in the current environment.
 apidrift is tested with hand-written good/bad fixture pairs per seed library (openai,
 pandas, requests, …) and a soundness-weighted suite that asserts it stays *silent* on the
 ambiguous, `**kwargs`, C-extension, wildcard-import, dynamic-`__getattr__`, and
-deprecation-proxy cases. A regression set drawn from public version-drift benchmarks
-(GitChameleon, VersiCode, CodeUpdateArena) is planned but not yet wired in — no validated
-count is claimed until it is.
+deprecation-proxy cases.
+
+On top of that it is **validated against 30 real version-drift cases curated from the
+pandas and scikit-learn release notes** (removed/renamed symbols and removed keyword
+arguments), covering the same drift classes catalogued by benchmarks such as GitChameleon,
+VersiCode, and CodeUpdateArena. Each case asserts *both* directions: the drifted call is
+flagged, **and** its modern replacement stays silent. The set is pinned to the versions it
+was verified against (`pandas==2.3.3`, `scikit-learn==1.8.0`); install them with
+`pip install -e .[bench]` and run `pytest tests/test_benchmark.py` to reproduce the count.
+Candidates that could not be flagged soundly (e.g. pydantic's `**kwargs`-accepting `Field`)
+were dropped rather than counted — the number is the empirically passing total, not an
+aspiration.
 
 ## License
 

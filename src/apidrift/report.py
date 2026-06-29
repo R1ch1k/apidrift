@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import PurePath
 
 from apidrift.checks import Severity, Violation
 
@@ -109,10 +110,14 @@ def render_report(per_file: Sequence[tuple[str, Sequence[Violation]]]) -> str:
 
 
 def to_json_finding(path: str, violation: Violation) -> dict[str, object]:
-    """One finding as a stable, machine-readable object."""
+    """One finding as a stable, machine-readable object.
+
+    The ``path`` is normalized to forward slashes so machine consumers get a stable,
+    OS-independent key (the text report keeps the platform-native separator for humans).
+    """
     headline, _ = _phrase(violation)
     return {
-        "path": path,
+        "path": PurePath(path).as_posix(),
         "line": violation.lineno,
         "column": violation.col_offset,
         "severity": "ERROR" if violation.severity is Severity.ERROR else "NOTICE",
