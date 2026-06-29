@@ -50,13 +50,14 @@ def test_no_files_exits_two(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 @pytest.mark.skipif(not _FIXTURE.exists(), reason="run from repo root")
-def test_fixture_demo_flags_three(capsys: pytest.CaptureFixture[str]) -> None:
+def test_fixture_demo_flags_four(capsys: pytest.CaptureFixture[str]) -> None:
     code = main([str(_FIXTURE)])
     out = capsys.readouterr().out
     assert code == 1
-    assert "3 problems · checked against your installed versions" in out
+    # 3 existence errors (Check A) + 1 unexpected-keyword error (Check B).
+    assert "4 problems · checked against your installed versions" in out
     for symbol in ("read_exel", "concatenate", "TimeGrouper"):
         assert symbol in out
-    # The proxy and the bad-kwarg-but-present call must NOT appear as violations.
+    assert "unexpected keyword 'mangle_dupe_cols'" in out
+    # The deprecation proxy must stay silent under both checks (exists; signature raises).
     assert "ChatCompletion" not in out
-    assert "mangle_dupe_cols" not in out

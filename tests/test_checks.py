@@ -17,12 +17,17 @@ from pathlib import Path
 import pytest
 
 from apidrift import introspect, resolver
-from apidrift.checks import Violation, check_existence
+from apidrift.checks import Severity, Violation, check_existence, check_keywords
 
 
 def _violations(source: str) -> list[Violation]:
     resolution = resolver.resolve_source(source)
     return [v for v in (check_existence(c) for c in resolution.resolved) if v is not None]
+
+
+def _kw_violations(source: str) -> list[Violation]:
+    resolution = resolver.resolve_source(source)
+    return [v for call in resolution.resolved for v in check_keywords(call)]
 
 
 def _reset_env_caches() -> None:
@@ -37,9 +42,9 @@ def _reset_env_caches() -> None:
 def test_typo_flags_with_suggestion() -> None:
     (violation,) = _violations("import pandas as pd\npd.read_exel('x')\n")
     assert violation.check == "existence"
-    assert violation.missing_path == "pandas.read_exel"
-    assert violation.missing_symbol == "read_exel"
-    assert violation.parent_fqname == "pandas"
+    assert violation.severity is Severity.ERROR
+    assert violation.symbol == "pandas.read_exel"
+    assert violation.token == "read_exel"
     assert violation.package == "pandas"
     assert violation.version is not None
     assert "read_excel" in violation.suggestions
@@ -48,20 +53,20 @@ def test_typo_flags_with_suggestion() -> None:
 def test_cross_library_confusion_flags() -> None:
     # `concatenate` is numpy's spelling; pandas uses `concat`.
     (violation,) = _violations("import pandas as pd\npd.concatenate([])\n")
-    assert violation.missing_path == "pandas.concatenate"
+    assert violation.symbol == "pandas.concatenate"
     assert "concat" in violation.suggestions
 
 
 def test_version_removal_flags() -> None:
     # `TimeGrouper` was removed in pandas 1.0 (replaced by `Grouper`).
     (violation,) = _violations("import pandas as pd\npd.TimeGrouper('M')\n")
-    assert violation.missing_path == "pandas.TimeGrouper"
+    assert violation.symbol == "pandas.TimeGrouper"
     assert "Grouper" in violation.suggestions
 
 
 def test_from_import_missing_name_flags() -> None:
     (violation,) = _violations("from pandas import read_exel\nread_exel('x')\n")
-    assert violation.missing_path == "pandas.read_exel"
+    assert violation.symbol == "pandas.read_exel"
 
 
 # --------------------------------------------------------------------------- #
@@ -120,3 +125,74 @@ def test_broken_submodule_is_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_valid_deep_attribute_is_silent() -> None:
     # openai.OpenAI exists; the whole path resolves -> no violation.
     assert _violations("import openai\nopenai.OpenAI()\n") == []
+
+
+# --------------------------------------------------------------------------- #
+# Check B (keyword-arg validity)
+# --------------------------------------------------------------------------- #
+def test_unexpected_keyword_flags() -> None:
+    # `mangle_dupe_cols` was removed in pandas 2.0; read_csv has no **kwargs.
+    (violation,) = _kw_violations("import pandas as pd\npd.read_csv('x', mangle_dupe_cols=True)\n")
+    assert violation.check == "keyword"
+    assert violation.severity is Severity.ERROR
+    assert violation.symbol == "pandas.read_csv"
+    assert violation.token == "mangle_dupe_cols"
+    assert violation.package == "pandas"
+
+
+def test_valid_keyword_is_silent() -> None:
+    assert _kw_violations("import pandas as pd\npd.read_csv('x', sep=',')\n") == []
+
+
+def test_var_keyword_target_is_silent() -> None:
+    # requests.get(url, **kwargs) declares **kwargs -> any keyword could be valid.
+    assert _kw_violations("import requests\nrequests.get('u', verify=False, retries=3)\n") == []
+
+
+def test_no_signature_callable_is_silent() -> None:
+    # numpy.array is a C-extension callable; inspect.signature() raises -> silent.
+    assert _kw_violations("import numpy\nnumpy.array([1], bogus_kw=2)\n") == []
+
+
+def test_proxy_signature_raises_is_silent() -> None:
+    # openai 1.x's ChatCompletion proxy raises a CUSTOM exception when introspected.
+    # signature() must fail safe (not just ValueError/TypeError) -> no crash, no flag.
+    source = "import openai\nopenai.ChatCompletion.create(model='x', messages=[])\n"
+    assert _kw_violations(source) == []
+
+
+def test_kwargs_unpacking_does_not_suppress_explicit_bad_keyword() -> None:
+    # `**opts` keys are unknown (skipped), but an explicit bad keyword still flags.
+    source = "import pandas as pd\nopts = {}\npd.read_csv('x', mangle_dupe_cols=True, **opts)\n"
+    (violation,) = _kw_violations(source)
+    assert violation.token == "mangle_dupe_cols"
+
+
+def test_absent_symbol_does_not_also_run_kwargs() -> None:
+    # check_call short-circuits on an absent symbol: exactly one (existence) violation.
+    from apidrift.checks import check_call
+
+    resolution = resolver.resolve_source("import pandas as pd\npd.read_exel('x', bogus=1)\n")
+    violations = [v for call in resolution.resolved for v in check_call(call)]
+    assert len(violations) == 1
+    assert violations[0].check == "existence"
+
+
+# --- positional-only soundness (uses the importable legacy_lib fixture) --- #
+def test_valid_keyword_not_flagged_with_positional_only() -> None:
+    # `c` is positional-or-keyword on positional_only(a, b, /, c) -> a VALID keyword.
+    # The accepted-keyword set must not false-flag it, and must not crash on the `/`.
+    source = "import legacy_lib\nlegacy_lib.positional_only(1, 2, c=3)\n"
+    assert _kw_violations(source) == []
+
+
+def test_normal_keyword_not_flagged() -> None:
+    assert _kw_violations("import legacy_lib\nlegacy_lib.normal(x=1, y=2)\n") == []
+
+
+def test_positional_only_passed_by_keyword_flags() -> None:
+    # `a`/`b` are positional-only and there is no **kwargs, so passing them by keyword
+    # is a genuine runtime error -> sound to flag. `c` (a valid keyword) stays unflagged.
+    source = "import legacy_lib\nlegacy_lib.positional_only(a=1, b=2, c=3)\n"
+    tokens = {v.token for v in _kw_violations(source)}
+    assert tokens == {"a", "b"}

@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from apidrift import __version__
-from apidrift.checks import Violation, check_existence
+from apidrift.checks import Severity, Violation, check_call
 from apidrift.report import render_report
 from apidrift.resolver import FileResolution, resolve_file
 
@@ -47,7 +47,10 @@ def collect_python_files(paths: Sequence[str]) -> list[Path]:
 
 
 def _check(resolution: FileResolution) -> list[Violation]:
-    return [v for v in (check_existence(c) for c in resolution.resolved) if v is not None]
+    violations: list[Violation] = []
+    for call in resolution.resolved:
+        violations.extend(check_call(call))
+    return violations
 
 
 def _configure_utf8() -> None:
@@ -126,8 +129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             for line in verbose_lines:
                 print(f"  {line}")
 
-    total_violations = sum(len(violations) for _, violations in per_file)
-    return 1 if total_violations else 0
+    # Errors gate CI; notices (future deprecation check) do not, by default.
+    total_errors = sum(
+        1 for _, violations in per_file for v in violations if v.severity is Severity.ERROR
+    )
+    return 1 if total_errors else 0
 
 
 if __name__ == "__main__":

@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from apidrift.checks import Violation
+from apidrift.checks import Severity, Violation
 from apidrift.report import format_violation, render_report, summary_line
 
 
-def _violation(**overrides: object) -> Violation:
+def _existence(**overrides: object) -> Violation:
     base: dict[str, object] = {
         "check": "existence",
+        "severity": Severity.ERROR,
         "lineno": 11,
         "col_offset": 0,
-        "call_fqname": "pandas.read_exel",
-        "missing_path": "pandas.read_exel",
-        "missing_symbol": "read_exel",
-        "parent_fqname": "pandas",
+        "symbol": "pandas.read_exel",
+        "token": "read_exel",
         "package": "pandas",
         "version": "2.3.3",
         "suggestions": ("read_excel",),
@@ -23,21 +22,47 @@ def _violation(**overrides: object) -> Violation:
     return Violation(**base)  # type: ignore[arg-type]
 
 
-def test_format_violation_with_suggestion() -> None:
-    lines = format_violation("f.py", _violation())
+def _keyword(**overrides: object) -> Violation:
+    base: dict[str, object] = {
+        "check": "keyword",
+        "severity": Severity.ERROR,
+        "lineno": 7,
+        "col_offset": 0,
+        "symbol": "pandas.read_csv",
+        "token": "mangle_dupe_cols",
+        "package": "pandas",
+        "version": "2.3.3",
+        "suggestions": (),
+    }
+    base.update(overrides)
+    return Violation(**base)  # type: ignore[arg-type]
+
+
+def test_existence_with_suggestion() -> None:
+    lines = format_violation("f.py", _existence())
     assert lines[0] == "f.py:11   ERROR  pandas.read_exel not found in pandas 2.3.3"
     assert lines[1] == "   └─ did you mean: pandas.read_excel?"
 
 
-def test_format_violation_without_suggestion() -> None:
-    lines = format_violation("f.py", _violation(suggestions=()))
+def test_existence_without_suggestion() -> None:
+    lines = format_violation("f.py", _existence(suggestions=()))
     assert len(lines) == 1
     assert "did you mean" not in lines[0]
 
 
-def test_format_violation_without_version() -> None:
-    lines = format_violation("f.py", _violation(version=None))
+def test_existence_without_version() -> None:
+    lines = format_violation("f.py", _existence(version=None))
     assert lines[0] == "f.py:11   ERROR  pandas.read_exel not found in pandas"
+
+
+def test_keyword_violation_format() -> None:
+    lines = format_violation("f.py", _keyword())
+    assert lines == ["f.py:7   ERROR  pandas.read_csv() unexpected keyword 'mangle_dupe_cols'"]
+
+
+def test_keyword_violation_with_suggestion() -> None:
+    lines = format_violation("f.py", _keyword(token="verbos", suggestions=("verbose",)))
+    assert lines[1] == "   └─ did you mean: verbose?"
 
 
 def test_summary_line_pluralization() -> None:
@@ -47,10 +72,9 @@ def test_summary_line_pluralization() -> None:
 
 
 def test_render_report_orders_and_counts() -> None:
-    v1 = _violation(lineno=20, missing_path="pandas.concatenate")
-    v2 = _violation(lineno=11, missing_path="pandas.read_exel")
+    v1 = _existence(lineno=20, symbol="pandas.concatenate")
+    v2 = _existence(lineno=11, symbol="pandas.read_exel")
     report = render_report([("f.py", [v1, v2])])
-    # Sorted by line: read_exel (11) before concatenate (20).
     assert report.index("read_exel") < report.index("concatenate")
     assert report.endswith("2 problems · checked against your installed versions")
 

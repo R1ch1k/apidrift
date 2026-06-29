@@ -16,6 +16,7 @@ from __future__ import annotations
 import difflib
 import importlib
 import importlib.metadata
+import inspect
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
@@ -103,6 +104,23 @@ def public_members(obj: object) -> list[str]:
 def did_you_mean(name: str, candidates: list[str], *, limit: int = 3) -> tuple[str, ...]:
     """Closest ``candidates`` to ``name`` via difflib (the "did you mean" suggestion)."""
     return tuple(difflib.get_close_matches(name, candidates, n=limit, cutoff=0.6))
+
+
+def safe_signature(obj: object) -> inspect.Signature | None:
+    """``inspect.signature(obj)`` or ``None`` if it cannot be introspected — fail-safe.
+
+    The catch is deliberately broad. Beyond the documented ``ValueError`` /
+    ``TypeError`` (C-extension callables, some builtins), deprecation proxies can make
+    ``signature()`` raise a *custom* exception of their own — e.g. openai 1.x's
+    ``ChatCompletion`` raises ``APIRemovedInV1`` when introspected. Any such failure is
+    unverifiable and must be silent, never a crash and never a flag.
+    """
+    if not callable(obj):
+        return None
+    try:
+        return inspect.signature(obj)
+    except Exception:  # any failure, incl. custom proxy exceptions -> unverifiable
+        return None
 
 
 @cache
