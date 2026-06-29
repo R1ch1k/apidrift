@@ -229,10 +229,26 @@ def test_star_import_after_binding_drops_rebindable_name() -> None:
     assert _fqnames(source) == set()
 
 
-def test_star_import_before_binding_keeps_safe_name() -> None:
-    # The explicit import comes AFTER every wildcard, so nothing rebinds it -> keep it.
+def test_star_import_before_binding_also_drops_the_name() -> None:
+    # FIX 4: line order is no defense. Even an explicit import textually AFTER every wildcard
+    # is dropped — a wildcard in a loop/branch can rebind the name at runtime regardless of
+    # where it sits in the source. Over-dropping to silence is the sound choice (tenet #1).
     source = "from somemod_zzz import *\nfrom pandas import read_csv\nread_csv('x')\n"
-    assert _fqnames(source) == {"pandas.read_csv"}
+    assert _fqnames(source) == set()
+
+
+def test_wildcard_with_conditional_explicit_import_does_not_resolve() -> None:
+    # The Codex loop/branch repro the old line-number heuristic false-flagged: the wildcard
+    # can bind `pd` at runtime while the explicit `import pandas as pd` sits on a LATER line
+    # inside a branch that may never run. The old rule trusted line order and kept `pd` ->
+    # `pd.read_exel` resolved to pandas -> a false positive. The blunt rule drops `pd` flat.
+    source = (
+        "from plugin_registry_zzz import *\n"
+        "if False:\n"
+        "    import pandas as pd\n"
+        "pd.read_exel('x')\n"
+    )
+    assert _fqnames(source) == set()
 
 
 def test_stdlib_is_skipped() -> None:

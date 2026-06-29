@@ -69,8 +69,12 @@ def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> I
     """The introspection record for a call, from the cache when possible.
 
     With no cache (the default, used in tests) every call is introspected live. With a
-    cache, a record is served by ``(package, version, fqname)`` — and only re-introspected
-    on a miss, which is the only path that imports the package.
+    cache, a record is served by ``(package, version, fqname)`` — but a cached record may
+    never *flag* on its own (tenet: a cached value that lies must never produce a finding).
+    So the asymmetry: a cached record that resolves to silence for this call is served fast
+    (no import), while a cached record that would emit a diagnostic is RE-CONFIRMED by live
+    introspection before it is trusted — re-introspection overwrites any poison and is what
+    actually gets reported. A genuine drift survives re-confirmation and still flags.
     """
     if cache is None:
         return introspect_fqname(call.root_package, call.fqname)
@@ -80,11 +84,17 @@ def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> I
         return introspect_fqname(call.root_package, call.fqname)  # version-less -> never cache
 
     cached = cache.get(call.root_package, version, call.fqname)
-    if cached is not None:
+    if cached is None:
+        record = introspect_fqname(call.root_package, call.fqname)
+        cache.put(call.root_package, version, call.fqname, record)
+        return record
+
+    # Cache hit. Serve silence fast; re-confirm anything that would cry wolf.
+    if not run_checks(call, cached):
         return cached
-    record = introspect_fqname(call.root_package, call.fqname)
-    cache.put(call.root_package, version, call.fqname, record)
-    return record
+    fresh = introspect_fqname(call.root_package, call.fqname)
+    cache.put(call.root_package, version, call.fqname, fresh)  # overwrite any poisoned entry
+    return fresh
 
 
 def resolve_records(
@@ -100,11 +110,17 @@ def resolve_records(
     importing each package once). New definitive records are written back to the cache.
     This is the only path the CLI uses, so no package is ever imported in apidrift's own
     process.
+
+    A cache-served record may never flag on its own: any cached record that would emit a
+    diagnostic for some call is RE-CONFIRMED through the same isolated worker before it is
+    trusted (and the fresh record overwrites any poisoned entry). Silence-serving hits skip
+    the worker entirely — fast when staying silent, careful when about to cry wolf.
     """
     wanted = {(call.root_package, call.fqname) for call in calls}
     versions = {root: package_version(root) for root, _ in wanted}
 
     records: dict[tuple[str, str], IntrospectionRecord] = {}
+    cached_keys: set[tuple[str, str]] = set()
     misses: list[tuple[str, str]] = []
     for key in wanted:
         root, fqname = key
@@ -113,6 +129,7 @@ def resolve_records(
             cached = cache.get(root, version, fqname)
             if cached is not None:
                 records[key] = cached
+                cached_keys.add(key)
                 continue
         misses.append(key)
 
@@ -123,6 +140,22 @@ def resolve_records(
             version = versions[root]
             if cache is not None and version is not None:
                 cache.put(root, version, fqname, record)  # put() ignores non-definitive records
+
+    # Re-confirm any cache-served record that would flag: a cached record alone must never
+    # cry wolf. Re-introspection runs in the same isolated worker, so the parent still never
+    # imports a package; the fresh record replaces the cached one (poison and all).
+    suspect: set[tuple[str, str]] = set()
+    for call in calls:
+        key = (call.root_package, call.fqname)
+        if key in cached_keys and key not in suspect and run_checks(call, records[key]):
+            suspect.add(key)
+    if suspect:
+        for key, record in introspect_batch(sorted(suspect)).items():
+            records[key] = record
+            root, fqname = key
+            version = versions[root]
+            if cache is not None and version is not None:
+                cache.put(root, version, fqname, record)
     return records
 
 

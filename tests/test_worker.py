@@ -15,6 +15,7 @@ package on ``sys.path`` so the worker actually imports it.
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -121,3 +122,44 @@ def test_sys_exit_package_does_not_abort_cli_run(
     out = capsys.readouterr().out
     assert code == 0  # the package's sys.exit did not become apidrift's exit code
     assert "0 problems" in out
+
+
+# --------------------------------------------------------------------------- #
+# FIX 2 — imported code cannot forge the worker's result by monkeypatching the
+# serialization / file-write path on import.
+# --------------------------------------------------------------------------- #
+def test_import_time_write_text_patch_cannot_forge_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The package patches Path.write_text AND json.dumps on import to forge an "absent"
+    # record for its own real symbol. The worker binds its serialization + write primitives
+    # before importing, so the forgery cannot land: `go` resolves correctly (not flagged).
+    forging = (
+        "import json\n"
+        "from pathlib import Path\n"
+        "_forged = '{\"forger_pkg_zzz.go\": {\"status\": \"absent\", "
+        "\"missing_index\": 1, \"missing_segment\": \"go\"}}'\n"
+        "def _evil_write_text(self, *a, **k):\n"
+        "    with open(self, 'w', encoding='utf-8') as f:\n"
+        "        f.write(_forged)\n"
+        "Path.write_text = _evil_write_text\n"
+        "json.dumps = lambda *a, **k: _forged\n"
+        "def go():\n    return 1\n"
+    )
+    _install_package(tmp_path, monkeypatch, "forger_pkg_zzz", forging)
+    records = introspect_batch([("forger_pkg_zzz", "forger_pkg_zzz.go")])
+    # If the forgery had landed, this would be "absent"; the real symbol resolves.
+    assert records[("forger_pkg_zzz", "forger_pkg_zzz.go")].status == "resolved"
+
+
+# --------------------------------------------------------------------------- #
+# FIX 3 — an unusable temp directory must not crash before the fail-safe.
+# --------------------------------------------------------------------------- #
+def test_missing_tempdir_is_unverifiable_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # tempfile.mkstemp runs INSIDE the worker fail-safe now: a missing temp dir degrades the
+    # batch to unverifiable (silent) rather than raising before the guard.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "does-not-exist"))
+    records = introspect_batch([("pandas", "pandas.read_csv")])
+    assert records[("pandas", "pandas.read_csv")].status == "unverifiable"

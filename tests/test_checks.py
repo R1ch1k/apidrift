@@ -219,6 +219,23 @@ def test_functools_wraps_genuinely_bad_keyword_still_flags() -> None:
     assert violation.token == "totally_bogus"
 
 
+def test_synthetic_signature_over_varkw_is_silent() -> None:
+    # FIX 5: a hand-set, narrower __signature__ over a **kwargs callable must not turn a
+    # real keyword into a false positive. A synthetic signature is an unreliable basis for
+    # keyword rejection -> stay silent. (`beta` is not in the advertised sig, but the real
+    # callable accepts it via **kwargs.)
+    source = "import legacy_lib\nlegacy_lib.varkw_with_synthetic_signature(beta=1)\n"
+    assert _kw_violations(source) == []
+
+
+def test_genuinely_bad_keyword_on_real_signature_still_flags() -> None:
+    # The flip side of FIX 5: a genuine (introspection-derived) signature still rejects a
+    # bad keyword. `normal(x, y)` has no **kwargs and no synthetic signature, so `z` flags.
+    source = "import legacy_lib\nlegacy_lib.normal(x=1, z=99)\n"
+    (violation,) = _kw_violations(source)
+    assert violation.token == "z"
+
+
 # --------------------------------------------------------------------------- #
 # Check C (PEP 702 __deprecated__ deprecation)
 # --------------------------------------------------------------------------- #

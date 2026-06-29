@@ -317,18 +317,41 @@ def _signature_kwargs(signature: inspect.Signature) -> tuple[bool, frozenset[str
     return has_var_keyword, acceptable
 
 
+def _has_synthetic_signature(obj: object) -> bool:
+    """True if ``obj`` carries an explicit ``__signature__`` that ``inspect`` would honor.
+
+    ``inspect.signature`` honors an author-set ``__signature__`` over the callable's real
+    parameters. A *narrower* synthetic signature laid over a ``**kwargs`` callable (a common
+    decorator/proxy pattern) would turn perfectly valid keywords into false positives, so a
+    synthetic signature is an unreliable basis for keyword REJECTION. Ordinary functions and
+    classes have no ``__signature__`` (it is derived from ``__code__`` on demand), so they are
+    unaffected — only a hand-set one trips this, and there we decline to judge keywords.
+    """
+    try:
+        return hasattr(obj, "__signature__")
+    except Exception:  # even probing is unreliable -> be conservative and treat as synthetic
+        return True
+
+
 def _keyword_signatures(obj: object) -> list[inspect.Signature]:
     """The signature(s) to trust for keyword validity, or ``[]`` if it is ambiguous.
 
-    Normally just ``inspect.signature(obj)``. But ``functools.wraps`` sets ``__wrapped__``
-    and ``inspect.signature`` follows it by default — reporting the *wrapped* function's
-    parameters, which misrepresents a wrapper that adds or drops keywords and would
-    false-flag a perfectly valid call. So when ``__wrapped__`` is present we require BOTH
-    the followed and the unwrapped signatures, and the caller treats a keyword as valid if
-    *either* accepts it (only what both reject is flagged). If either signature cannot be
-    read the two cannot be reconciled, so introspection is ambiguous → ``[]`` → silence.
+    Normally just ``inspect.signature(obj)``. Two cases force silence instead:
+
+    * A hand-set ``__signature__`` (see :func:`_has_synthetic_signature`) can understate a
+      ``**kwargs`` callable, so it is not a sound basis for rejecting a keyword → ``[]``.
+    * ``functools.wraps`` sets ``__wrapped__`` and ``inspect.signature`` follows it by
+      default — reporting the *wrapped* function's parameters, which misrepresents a wrapper
+      that adds or drops keywords and would false-flag a valid call. So when ``__wrapped__``
+      is present we require BOTH the followed and the unwrapped signatures, and the caller
+      treats a keyword as valid if *either* accepts it (only what both reject is flagged). If
+      either signature cannot be read the two cannot be reconciled → ``[]`` → silence.
     """
     if not callable(obj):
+        return []
+    if _has_synthetic_signature(obj):
+        # A synthetic signature may lie about a **kwargs callable; rejecting keywords against
+        # it risks a false positive. Decline to judge keywords here (tenet #1: silence wins).
         return []
     followed = safe_signature(obj)  # follow_wrapped=True (the default)
     if not hasattr(obj, "__wrapped__"):

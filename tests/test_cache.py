@@ -13,7 +13,7 @@ import pytest
 
 from apidrift import resolver
 from apidrift.cache import IntrospectionCache
-from apidrift.checks import check_call
+from apidrift.checks import check_call, resolve_records, run_checks
 from apidrift.cli import main
 from apidrift.introspect import IntrospectionRecord, package_version
 
@@ -155,3 +155,103 @@ def test_cache_dir_pointing_at_a_file_does_not_crash(
     out = capsys.readouterr().out
     assert code == 1  # the real drift is still found despite the unusable cache
     assert "pandas.read_exel not found" in out
+
+
+# --------------------------------------------------------------------------- #
+# FIX 1: a cached record may never flag on its own. Validation catches malformed data,
+# not well-formed LIES — those are caught by re-confirming any cached would-be flag
+# against live introspection. Fast when staying silent, careful when about to cry wolf.
+# --------------------------------------------------------------------------- #
+def test_wellformed_poisoned_absent_is_reconfirmed_not_flagged(tmp_path: Path) -> None:
+    # A STRUCTURALLY-VALID, consistency-passing lie: it claims the real pandas.read_csv is
+    # absent at the correct index/segment, so record_from_dict accepts it AND _existence's
+    # match check passes. Only re-confirmation by live introspection stops the false alarm.
+    version = package_version("pandas")
+    assert version is not None
+    cache = IntrospectionCache(tmp_path / "c")
+    poison = {"status": "absent", "missing_index": 1, "missing_segment": "read_csv"}
+    _write_table(cache, "pandas", version, {"pandas.read_csv": poison})
+    violations = check_call(_one_call("import pandas as pd\npd.read_csv('x')\n"), cache)
+    assert all(v.check != "existence" for v in violations)
+
+
+def test_cached_genuine_absent_still_flags_after_reconfirmation(tmp_path: Path) -> None:
+    # The other side: a cached absent record for a GENUINELY absent symbol survives
+    # re-confirmation (live introspection agrees) -> it still flags. Re-confirmation
+    # suppresses lies, not real drift.
+    version = package_version("pandas")
+    assert version is not None
+    cache = IntrospectionCache(tmp_path / "c")
+    real = {"status": "absent", "missing_index": 1, "missing_segment": "read_exel"}
+    _write_table(cache, "pandas", version, {"pandas.read_exel": real})
+    violations = check_call(_one_call("import pandas as pd\npd.read_exel('x')\n"), cache)
+    assert any(v.check == "existence" for v in violations)
+
+
+def test_clean_cached_hit_serves_without_introspecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cached record that resolves to silence is served fast — no live introspection at all.
+    version = package_version("pandas")
+    assert version is not None
+    cache = IntrospectionCache(tmp_path / "c")
+    cache.put(
+        "pandas",
+        version,
+        "pandas.read_csv",
+        IntrospectionRecord(status="resolved", has_signature=True, has_var_keyword=True),
+    )
+
+    def boom(root: str, fqname: str) -> IntrospectionRecord:
+        raise AssertionError("a clean cached hit must not re-introspect")
+
+    monkeypatch.setattr("apidrift.checks.introspect_fqname", boom)
+    assert check_call(_one_call("import pandas as pd\npd.read_csv('x')\n"), cache) == []
+
+
+def test_resolve_records_reconfirms_poison_via_worker(tmp_path: Path) -> None:
+    # The CLI batch path: a poisoned cache hit that would flag is re-introspected through the
+    # injected worker (not in-process), and the fresh record overrides the poison.
+    version = package_version("pandas")
+    assert version is not None
+    cache = IntrospectionCache(tmp_path / "c")
+    cache.put(
+        "pandas",
+        version,
+        "pandas.read_csv",
+        IntrospectionRecord(status="absent", missing_index=1, missing_segment="read_csv"),
+    )
+    call = _one_call("import pandas as pd\npd.read_csv('x')\n")
+    seen: dict[str, object] = {}
+
+    def fake_batch(keys: object) -> dict[tuple[str, str], IntrospectionRecord]:
+        keylist = list(keys)  # type: ignore[call-overload]
+        seen["keys"] = keylist
+        truth = IntrospectionRecord(status="resolved", has_signature=True, has_var_keyword=True)
+        return dict.fromkeys(keylist, truth)
+
+    records = resolve_records([call], cache, fake_batch)
+    key = ("pandas", "pandas.read_csv")
+    assert seen["keys"] == [key]  # the poisoned hit WAS re-confirmed via the worker
+    assert records[key].status == "resolved"
+    assert run_checks(call, records[key]) == []
+
+
+def test_resolve_records_clean_hit_skips_the_worker(tmp_path: Path) -> None:
+    # A clean cached hit never touches the worker (no subprocess) — silence is served fast.
+    version = package_version("pandas")
+    assert version is not None
+    cache = IntrospectionCache(tmp_path / "c")
+    cache.put(
+        "pandas",
+        version,
+        "pandas.read_csv",
+        IntrospectionRecord(status="resolved", has_signature=True, has_var_keyword=True),
+    )
+    call = _one_call("import pandas as pd\npd.read_csv('x')\n")
+
+    def boom(keys: object) -> dict[tuple[str, str], IntrospectionRecord]:
+        raise AssertionError("a clean cached hit must not invoke the worker")
+
+    records = resolve_records([call], cache, boom)
+    assert records[("pandas", "pandas.read_csv")].status == "resolved"

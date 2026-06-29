@@ -8,6 +8,7 @@ checks must handle correctly.
 from __future__ import annotations
 
 import functools
+import inspect
 import warnings
 
 from typing_extensions import deprecated
@@ -16,6 +17,23 @@ from typing_extensions import deprecated
 def normal(x: int, y: int) -> tuple[int, int]:
     """Ordinary positional-or-keyword parameters."""
     return (x, y)
+
+
+def varkw_with_synthetic_signature(**kwargs: object) -> dict[str, object]:
+    """A ``**kwargs`` callable whose hand-set ``__signature__`` LIES about what it accepts.
+
+    The common decorator/proxy shape: the real callable takes any keyword, but an explicit
+    ``__signature__`` (which ``inspect.signature`` honors) advertises only ``alpha``. Check B
+    must NOT reject a different keyword here — a synthetic signature is an unreliable basis for
+    keyword rejection, so the sound response is silence (FIX 5).
+    """
+    return kwargs
+
+
+# Narrow the advertised signature to a single keyword, hiding the real **kwargs.
+varkw_with_synthetic_signature.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+    lambda alpha=None: None
+)
 
 
 def _wrapped_base(a: int, b: int) -> tuple[int, ...]:

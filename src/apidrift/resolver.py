@@ -62,7 +62,6 @@ class ImportedName:
     local_name: str
     base_fqname: str
     root_package: str
-    lineno: int
 
 
 @dataclass(frozen=True)
@@ -125,12 +124,12 @@ def build_import_table(tree: ast.Module) -> ImportTable:
     ``from x import a, b as c``. ``from x import *`` marks the module wildcard.
     Relative imports are recorded as local-only. For soundness, names that are
     imported ambiguously (to two different targets) or reassigned anywhere in the
-    module are dropped from the table.
+    module are dropped from the table — and if any wildcard is present, every explicit
+    imported name is dropped (a wildcard can rebind any of them; see below).
     """
     names: dict[str, ImportedName] = {}
     conflicts: set[str] = set()
     wildcard: list[str] = []
-    wildcard_lines: list[int] = []
     relative: set[str] = set()
 
     for node in ast.walk(tree):
@@ -144,7 +143,7 @@ def build_import_table(tree: ast.Module) -> ImportTable:
                 else:
                     # `import a.b.c` binds only the top name `a`
                     local, base = root, root
-                _register(names, conflicts, ImportedName(local, base, root, node.lineno))
+                _register(names, conflicts, ImportedName(local, base, root))
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 # relative import: from . / from ..pkg import x
@@ -159,25 +158,24 @@ def build_import_table(tree: ast.Module) -> ImportTable:
             for alias in node.names:
                 if alias.name == "*":
                     wildcard.append(module)
-                    wildcard_lines.append(node.lineno)
                     continue
                 local = alias.asname or alias.name
                 base = f"{module}.{alias.name}"
-                _register(names, conflicts, ImportedName(local, base, root, node.lineno))
+                _register(names, conflicts, ImportedName(local, base, root))
 
     # Soundness: a name that is ambiguous or reassigned cannot be trusted.
     for name in conflicts | _reassigned_names(tree):
         names.pop(name, None)
 
-    # A `from x import *` can silently rebind any name bound at or before it. We cannot see
-    # the wildcard's exports without importing, so we conservatively drop every imported
-    # name a wildcard could overwrite (bound on a line <= the last wildcard). Names bound
-    # strictly after every wildcard are clearly safe and kept.
-    if wildcard_lines:
-        last_wildcard = max(wildcard_lines)
-        for name, entry in list(names.items()):
-            if entry.lineno <= last_wildcard:
-                del names[name]
+    # A `from x import *` can rebind ANY name in the module namespace, and we cannot see the
+    # wildcard's exports without importing. Line/loop order is no defense: a wildcard inside a
+    # loop or branch can execute after a textually-later explicit import, and a conditional
+    # explicit import may never run while the wildcard's binding stands. So once any wildcard
+    # is present we cannot trust the target of ANY explicit imported name and drop them all.
+    # Over-dropping only costs recall; silence is sound (tenet #1). Bare names that originate
+    # from the wildcard are refused separately, in `_skip_reason_for_unimported`.
+    if wildcard:
+        names.clear()
 
     return ImportTable(
         names=names,
