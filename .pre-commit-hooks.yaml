@@ -1,0 +1,19 @@
+# pre-commit hook definition. Add apidrift to your .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/R1ch1k/apidrift
+#       rev: v0.0.1
+#       hooks:
+#         - id: apidrift
+#
+# NOTE: language is `system`, not `python`. apidrift checks calls against the versions
+# of your dependencies that are *actually installed*, so it must run in your project's
+# environment (where those packages live), not in an isolated hook venv that wouldn't
+# have them. Install apidrift into that environment: `pip install apidrift`.
+- id: apidrift
+  name: apidrift
+  description: Flag API calls that don't exist in the installed dependency version.
+  entry: apidrift
+  language: system
+  types: [python]
+  require_serial: true

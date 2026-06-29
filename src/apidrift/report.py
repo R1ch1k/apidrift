@@ -1,18 +1,42 @@
-"""Diagnostic rendering — turns violations into the human-facing text output.
+"""Diagnostic rendering — turns violations into human text or machine JSON.
 
-Kept separate from the checks so the same ``Violation`` data can later feed a
-``--json`` formatter (M3) without touching detection logic. report.py owns the
-*phrasing* of each check; checks.py owns the structured data.
+Kept separate from the checks so the same ``Violation`` data drives both the default
+text output and ``--json``. report.py owns *presentation* (phrasing, the JSON schema);
+checks.py owns the structured data. Both formats are derived from the same violations,
+so they never disagree — including the exit code.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 
 from apidrift.checks import Severity, Violation
 
 _BRANCH = "└─"  # "└─"
 _DOT = "·"  # "·"
+
+#: Bump when the --json structure changes incompatibly.
+JSON_SCHEMA_VERSION = 1
+
+
+def suggestion(violation: Violation) -> str | None:
+    """The single actionable "did you mean" replacement, or ``None``.
+
+    Existence suggestions are qualified with the parent (``pandas.read_excel``); keyword
+    suggestions are the bare parameter name; deprecations have none.
+    """
+    if not violation.suggestions:
+        return None
+    top = violation.suggestions[0]
+    if violation.check == "existence":
+        parent = violation.package
+        if "." in violation.symbol:
+            parent = violation.symbol.rsplit(".", 1)[0]
+        return f"{parent}.{top}"
+    if violation.check == "keyword":
+        return top
+    return None
 
 
 def _phrase(violation: Violation) -> tuple[str, str | None]:
@@ -22,19 +46,16 @@ def _phrase(violation: Violation) -> tuple[str, str | None]:
         where = f"{violation.package} {violation.version}"
 
     if violation.check == "existence":
-        parent = violation.package
-        if "." in violation.symbol:
-            parent = violation.symbol.rsplit(".", 1)[0]
-        detail = None
-        if violation.suggestions:
-            detail = f"did you mean: {parent}.{violation.suggestions[0]}?"
-        return f"{violation.symbol} not found in {where}", detail
+        hint = suggestion(violation)
+        return f"{violation.symbol} not found in {where}", (
+            f"did you mean: {hint}?" if hint else None
+        )
 
     if violation.check == "keyword":
-        detail = None
-        if violation.suggestions:
-            detail = f"did you mean: {violation.suggestions[0]}?"
-        return f"{violation.symbol}() unexpected keyword '{violation.token}'", detail
+        hint = suggestion(violation)
+        return f"{violation.symbol}() unexpected keyword '{violation.token}'", (
+            f"did you mean: {hint}?" if hint else None
+        )
 
     if violation.check == "deprecation":
         return f"{violation.symbol} is deprecated", violation.note
@@ -68,19 +89,57 @@ def summary_line(errors: int, notices: int = 0) -> str:
     return f" {_DOT} ".join(parts)
 
 
+def _counts(per_file: Sequence[tuple[str, Sequence[Violation]]]) -> tuple[int, int]:
+    errors = sum(1 for _, vs in per_file for v in vs if v.severity is Severity.ERROR)
+    notices = sum(1 for _, vs in per_file for v in vs if v.severity is Severity.NOTICE)
+    return errors, notices
+
+
 def render_report(per_file: Sequence[tuple[str, Sequence[Violation]]]) -> str:
     """Render all violations (in source order per file) followed by the summary."""
     out: list[str] = []
-    errors = 0
-    notices = 0
     for path, violations in per_file:
         for violation in sorted(violations, key=lambda v: (v.lineno, v.col_offset)):
             out.extend(format_violation(path, violation))
-            if violation.severity is Severity.ERROR:
-                errors += 1
-            else:
-                notices += 1
     if out:
         out.append("")
+    errors, notices = _counts(per_file)
     out.append(summary_line(errors, notices))
     return "\n".join(out)
+
+
+def to_json_finding(path: str, violation: Violation) -> dict[str, object]:
+    """One finding as a stable, machine-readable object."""
+    headline, _ = _phrase(violation)
+    return {
+        "path": path,
+        "line": violation.lineno,
+        "column": violation.col_offset,
+        "severity": "ERROR" if violation.severity is Severity.ERROR else "NOTICE",
+        "check": violation.check,
+        "symbol": violation.symbol,
+        "message": headline,
+        "suggestion": suggestion(violation),
+        "package": violation.package,
+        "version": violation.version,
+    }
+
+
+def render_json(per_file: Sequence[tuple[str, Sequence[Violation]]]) -> str:
+    """Render findings + a summary as JSON (stable schema; see README)."""
+    findings: list[dict[str, object]] = []
+    for path, violations in per_file:
+        for violation in sorted(violations, key=lambda v: (v.lineno, v.col_offset)):
+            findings.append(to_json_finding(path, violation))
+    errors, notices = _counts(per_file)
+    payload: dict[str, object] = {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "findings": findings,
+        "summary": {
+            "errors": errors,
+            "notices": notices,
+            "total": errors + notices,
+            "exit_code": 1 if errors else 0,
+        },
+    }
+    return json.dumps(payload, indent=2)

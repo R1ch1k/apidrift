@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 from apidrift.checks import Severity, Violation
-from apidrift.report import format_violation, render_report, summary_line
+from apidrift.report import format_violation, render_json, render_report, summary_line
 
 
 def _existence(**overrides: object) -> Violation:
@@ -110,3 +112,50 @@ def test_render_report_orders_and_counts() -> None:
 def test_render_report_empty_is_clean() -> None:
     report = render_report([("f.py", [])])
     assert report == "0 problems · checked against your installed versions"
+
+
+# --------------------------------------------------------------------------- #
+# JSON output
+# --------------------------------------------------------------------------- #
+def test_render_json_schema_and_summary() -> None:
+    payload = json.loads(render_json([("f.py", [_existence(), _keyword()])]))
+    assert payload["schema_version"] == 1
+    assert payload["summary"] == {"errors": 2, "notices": 0, "total": 2, "exit_code": 1}
+
+    by_check = {finding["check"]: finding for finding in payload["findings"]}
+    existence, keyword = by_check["existence"], by_check["keyword"]
+    assert existence == {
+        "path": "f.py",
+        "line": 11,
+        "column": 0,
+        "severity": "ERROR",
+        "check": "existence",
+        "symbol": "pandas.read_exel",
+        "message": "pandas.read_exel not found in pandas 2.3.3",
+        "suggestion": "pandas.read_excel",  # parent-qualified
+        "package": "pandas",
+        "version": "2.3.3",
+    }
+    assert keyword["check"] == "keyword"
+    assert keyword["suggestion"] is None  # no close param name
+
+
+def test_render_json_notice_exits_zero() -> None:
+    notice = Violation(
+        check="deprecation",
+        severity=Severity.NOTICE,
+        lineno=3,
+        col_offset=0,
+        symbol="legacy_lib.deprecated_fn",
+        token="",
+        package="legacy_lib",
+        version="1.0",
+        suggestions=(),
+        note="use renamed_fn() instead",
+    )
+    payload = json.loads(render_json([("f.py", [notice])]))
+    assert payload["summary"]["exit_code"] == 0
+    assert payload["summary"]["notices"] == 1
+    (finding,) = payload["findings"]
+    assert finding["severity"] == "NOTICE"
+    assert finding["suggestion"] is None

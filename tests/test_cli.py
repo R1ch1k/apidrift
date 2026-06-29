@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,30 @@ def test_deprecation_notice_does_not_gate(
     assert "legacy_lib.deprecated_fn is deprecated" in out
     assert "1 deprecation notice" in out
     assert "0 problems" not in out
+
+
+def test_json_output_is_machine_readable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "drift.py"
+    target.write_text("import pandas as pd\npd.read_exel('x')\n", encoding="utf-8")
+    code = main([str(target), "--json", "--no-cache"])
+    payload = json.loads(capsys.readouterr().out)  # must parse as a single JSON doc
+    assert code == payload["summary"]["exit_code"] == 1
+    (finding,) = payload["findings"]
+    assert finding["check"] == "existence"
+    assert finding["symbol"] == "pandas.read_exel"
+    assert finding["suggestion"] == "pandas.read_excel"
+    assert finding["package"] == "pandas"
+
+
+def test_clear_cache_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APIDRIFT_CACHE_DIR", str(tmp_path / "cc"))
+    code = main(["--clear-cache"])
+    assert code == 0
+    assert "cleared introspection cache" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(not _FIXTURE.exists(), reason="run from repo root")

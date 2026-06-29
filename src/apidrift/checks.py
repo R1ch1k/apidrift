@@ -1,30 +1,29 @@
-"""The checks. Kept cleanly separable from resolution and reporting.
+"""The checks. Kept cleanly separable from resolution, introspection, and reporting.
 
-v0 ships Check A (symbol existence) and Check B (keyword-arg validity). Both share one
-fail-safe walk of the resolved path against the *installed* package; the per-check
-logic stays independent on top of it. Every uncertainty — an import that fails, a
-dynamic ``__getattr__`` parent, a C-extension object, a callable with no introspectable
-signature — resolves to silence, never a flag. That asymmetry is the product (tenet #1):
-a missed drift is tolerable, a false alarm is not.
+v0 ships three checks: A (symbol existence), B (keyword-arg validity), C (PEP 702
+deprecation). Each is pure logic over an :class:`IntrospectionRecord` — the record does
+all the importing/introspecting (and may come from the on-disk cache), the checks just
+read it plus the call site. Every uncertainty in the record (``unverifiable``) resolves
+to silence, never a flag. That asymmetry is the product (tenet #1): a missed drift is
+tolerable, a false alarm is not.
 """
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from apidrift.introspect import (
-    SubmoduleStatus,
+    IntrospectionRecord,
     did_you_mean,
-    import_package,
-    is_introspectable_parent,
+    introspect_fqname,
     package_version,
-    public_members,
-    safe_signature,
-    try_import_submodule,
 )
 from apidrift.resolver import ResolvedCall
+
+if TYPE_CHECKING:
+    from apidrift.cache import IntrospectionCache
 
 
 class Severity(Enum):
@@ -56,63 +55,28 @@ class Violation:
 
 
 # --------------------------------------------------------------------------- #
-# Shared walk
+# Record acquisition (cache-aware)
 # --------------------------------------------------------------------------- #
-class _WalkStatus(Enum):
-    RESOLVED = "resolved"  # whole path exists; .obj is the target object
-    ABSENT = "absent"  # a segment is genuinely absent (Check A territory)
-    UNVERIFIABLE = "unverifiable"  # import failed / dynamic / C-ext / broken -> silent
+def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> IntrospectionRecord:
+    """The introspection record for a call, from the cache when possible.
 
-
-@dataclass(frozen=True)
-class _WalkResult:
-    status: _WalkStatus
-    obj: object = None
-    missing_index: int = -1
-    parent: object = None
-
-
-def _walk(call: ResolvedCall) -> _WalkResult:
-    """Resolve ``call.fqname`` against the installed package, fail-safe.
-
-    Extends the module boundary along importable submodules first, then resolves the
-    remaining segments via ``getattr``. Returns RESOLVED with the target object,
-    ABSENT at the first genuinely-absent segment, or UNVERIFIABLE for anything we
-    cannot trust.
+    With no cache (the default, used in tests) every call is introspected live. With a
+    cache, a record is served by ``(package, version, fqname)`` — and only re-introspected
+    on a miss, which is the only path that imports the package.
     """
-    module = import_package(call.root_package)
-    if module is None:
-        return _WalkResult(_WalkStatus.UNVERIFIABLE)
+    if cache is None:
+        return introspect_fqname(call.root_package, call.fqname)
 
-    segments = call.fqname.split(".")
-    obj: object = module
-    index = 1  # segments[0] is the root we just imported
+    version = package_version(call.root_package)
+    if version is None:
+        return introspect_fqname(call.root_package, call.fqname)  # version-less -> never cache
 
-    while index < len(segments):
-        candidate = ".".join(segments[: index + 1])
-        result = try_import_submodule(candidate)
-        if result.status is SubmoduleStatus.OK:
-            obj = result.module
-            index += 1
-        elif result.status is SubmoduleStatus.NOT_A_MODULE:
-            break
-        else:  # BROKEN -> a real module that won't import cleanly
-            return _WalkResult(_WalkStatus.UNVERIFIABLE)
-
-    while index < len(segments):
-        segment = segments[index]
-        parent = obj
-        try:
-            obj = getattr(parent, segment)
-        except AttributeError:
-            if not is_introspectable_parent(parent):
-                return _WalkResult(_WalkStatus.UNVERIFIABLE)
-            return _WalkResult(_WalkStatus.ABSENT, missing_index=index, parent=parent)
-        except Exception:  # a descriptor/property that raises -> unverifiable, stay silent
-            return _WalkResult(_WalkStatus.UNVERIFIABLE)
-        index += 1
-
-    return _WalkResult(_WalkStatus.RESOLVED, obj=obj)
+    cached = cache.get(call.root_package, version, call.fqname)
+    if cached is not None:
+        return cached
+    record = introspect_fqname(call.root_package, call.fqname)
+    cache.put(call.root_package, version, call.fqname, record)
+    return record
 
 
 # --------------------------------------------------------------------------- #
@@ -120,25 +84,23 @@ def _walk(call: ResolvedCall) -> _WalkResult:
 # --------------------------------------------------------------------------- #
 def check_existence(call: ResolvedCall) -> Violation | None:
     """Flag a resolved call whose dotted target is absent in the installed package."""
-    return _existence(call, _walk(call))
+    return _existence(call, record_for(call))
 
 
-def _existence(call: ResolvedCall, walk: _WalkResult) -> Violation | None:
-    if walk.status is not _WalkStatus.ABSENT:
+def _existence(call: ResolvedCall, record: IntrospectionRecord) -> Violation | None:
+    if record.status != "absent":
         return None
     segments = call.fqname.split(".")
-    index = walk.missing_index
-    token = segments[index]
     return Violation(
         check="existence",
         severity=Severity.ERROR,
         lineno=call.lineno,
         col_offset=call.col_offset,
-        symbol=".".join(segments[: index + 1]),
-        token=token,
+        symbol=".".join(segments[: record.missing_index + 1]),
+        token=record.missing_segment,
         package=call.root_package,
         version=package_version(call.root_package),
-        suggestions=did_you_mean(token, public_members(walk.parent)),
+        suggestions=record.suggestions,
     )
 
 
@@ -147,27 +109,15 @@ def _existence(call: ResolvedCall, walk: _WalkResult) -> Violation | None:
 # --------------------------------------------------------------------------- #
 def check_keywords(call: ResolvedCall) -> list[Violation]:
     """Flag keyword arguments not accepted by the resolved callable's signature."""
-    return _keywords(call, _walk(call))
+    return _keywords(call, record_for(call))
 
 
-def _keywords(call: ResolvedCall, walk: _WalkResult) -> list[Violation]:
-    if walk.status is not _WalkStatus.RESOLVED:
-        return []  # absent (Check A's job) or unverifiable -> silent
+def _keywords(call: ResolvedCall, record: IntrospectionRecord) -> list[Violation]:
+    if record.status != "resolved" or not record.has_signature or record.has_var_keyword:
+        # absent / unverifiable / no signature / **kwargs declared -> silent.
+        return []
 
-    signature = safe_signature(walk.obj)
-    if signature is None:
-        return []  # no introspectable signature -> unverifiable -> silent
-
-    parameters = signature.parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        return []  # **kwargs declared -> any keyword could be valid -> silent (mandatory guard)
-
-    acceptable = {
-        name
-        for name, param in parameters.items()
-        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    }
-
+    acceptable = set(record.acceptable_keywords)
     violations: list[Violation] = []
     for keyword in call.node.keywords:
         if keyword.arg is None:
@@ -193,24 +143,20 @@ def _keywords(call: ResolvedCall, walk: _WalkResult) -> list[Violation]:
 # Check C — PEP 702 deprecation (and ONLY that)
 # --------------------------------------------------------------------------- #
 def check_deprecation(call: ResolvedCall) -> Violation | None:
-    """Flag a resolved symbol carrying a PEP 702 ``__deprecated__`` marker.
+    """Flag a resolved symbol carrying a PEP 702 ``__deprecated__`` marker (NOTICE).
 
-    This is the entire scope of deprecation detection: exactly one signal, the
-    ``__deprecated__`` attribute set by ``warnings.deprecated`` /
+    Exactly one signal: the ``__deprecated__`` attribute set by ``warnings.deprecated`` /
     ``typing_extensions.deprecated`` / the ``@deprecated`` decorator. Deprecations
     expressed any other way (custom proxies, docstrings, runtime warnings, a curated
     version database) are intentionally NOT detected — that keeps the check sound and
-    deterministic. The diagnostic is a NOTICE, never an ERROR: deprecated code still
-    works, so it must not gate CI by default.
+    deterministic. NOTICE, never ERROR: deprecated code still works, so it does not gate
+    CI by default.
     """
-    return _deprecation(call, _walk(call))
+    return _deprecation(call, record_for(call))
 
 
-def _deprecation(call: ResolvedCall, walk: _WalkResult) -> Violation | None:
-    if walk.status is not _WalkStatus.RESOLVED:
-        return None
-    message = _deprecated_marker(walk.obj)
-    if message is None:
+def _deprecation(call: ResolvedCall, record: IntrospectionRecord) -> Violation | None:
+    if record.status != "resolved" or record.deprecated_message is None:
         return None
     return Violation(
         check="deprecation",
@@ -221,38 +167,21 @@ def _deprecation(call: ResolvedCall, walk: _WalkResult) -> Violation | None:
         token="",
         package=call.root_package,
         version=package_version(call.root_package),
-        note=message or None,
+        note=record.deprecated_message or None,
     )
 
 
-def _deprecated_marker(obj: object) -> str | None:
-    """The ``__deprecated__`` message if present in the object's OWN namespace.
-
-    Read from ``vars(obj)``, never ``getattr``: a non-deprecated subclass inherits a
-    deprecated base's ``__deprecated__`` via attribute lookup, which would be a false
-    positive. The own ``__dict__`` is exactly where the PEP 702 decorator stores it.
-    """
-    try:
-        own = vars(obj)
-    except TypeError:  # objects without a __dict__ (most C-level callables) -> silent
-        return None
-    marker = own.get("__deprecated__")
-    if marker is None:
-        return None
-    return marker if isinstance(marker, str) else ""
-
-
 # --------------------------------------------------------------------------- #
-# Aggregate — one walk, all checks
+# Aggregate — one record, all checks
 # --------------------------------------------------------------------------- #
-def check_call(call: ResolvedCall) -> list[Violation]:
-    """Run every check against one call with a single walk; return all violations."""
-    walk = _walk(call)
-    existence = _existence(call, walk)
+def check_call(call: ResolvedCall, cache: IntrospectionCache | None = None) -> list[Violation]:
+    """Run every check against one call from a single record; return all violations."""
+    record = record_for(call, cache)
+    existence = _existence(call, record)
     if existence is not None:
         return [existence]  # an absent symbol short-circuits: no point checking it further
-    violations = _keywords(call, walk)
-    deprecation = _deprecation(call, walk)
+    violations = _keywords(call, record)
+    deprecation = _deprecation(call, record)
     if deprecation is not None:
         violations.append(deprecation)
     return violations

@@ -1,0 +1,23 @@
+name: "apidrift"
+description: "Flag API calls that don't exist in the installed dependency version."
+branding:
+  icon: "alert-triangle"
+  color: "purple"
+
+inputs:
+  paths:
+    description: "Files, directories, or glob patterns to check."
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    # apidrift introspects the packages installed in *this* environment, so your own
+    # dependencies must already be installed (do that in an earlier workflow step).
+    - name: Install apidrift
+      shell: bash
+      run: pip install "${{ github.action_path }}"
+    - name: Run apidrift
+      shell: bash
+      run: apidrift ${{ inputs.paths }}

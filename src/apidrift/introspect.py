@@ -136,3 +136,116 @@ def package_version(root: str) -> str | None:
         return importlib.metadata.version(dist)
     except Exception:  # version is cosmetic; never fail the check over it
         return None
+
+
+def _deprecated_marker(obj: object) -> str | None:
+    """The PEP 702 ``__deprecated__`` message if present in the object's OWN namespace.
+
+    Read from ``vars(obj)``, never ``getattr``: a non-deprecated subclass inherits a
+    deprecated base's ``__deprecated__`` via attribute lookup, which would be a false
+    positive. The own ``__dict__`` is exactly where the ``@deprecated`` decorator stores
+    it. Returns ``None`` when not deprecated, the (possibly empty) message otherwise.
+    """
+    try:
+        own = vars(obj)
+    except TypeError:  # objects without a __dict__ (most C-level callables) -> silent
+        return None
+    marker = own.get("__deprecated__")
+    if marker is None:
+        return None
+    return marker if isinstance(marker, str) else ""
+
+
+# --------------------------------------------------------------------------- #
+# Whole-symbol introspection -> a serializable record
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class IntrospectionRecord:
+    """Everything the checks need about one fully-qualified symbol, as plain data.
+
+    This is the cache unit: it is deterministic for a given ``(package, version,
+    fqname)`` and contains no live objects, so it round-trips to disk. ``status`` is
+    one of ``"resolved"`` / ``"absent"`` / ``"unverifiable"``. The remaining fields are
+    populated per status; a check reads only the fields relevant to its verdict.
+    """
+
+    status: str
+    # status == "absent":
+    missing_index: int = -1
+    missing_segment: str = ""
+    suggestions: tuple[str, ...] = ()  # precomputed "did you mean" for the missing segment
+    # status == "resolved":
+    has_signature: bool = False
+    has_var_keyword: bool = False
+    acceptable_keywords: tuple[str, ...] = ()  # params passable by keyword
+    deprecated_message: str | None = None  # PEP 702 marker; None => not deprecated
+
+
+def introspect_fqname(root_package: str, fqname: str) -> IntrospectionRecord:
+    """Resolve ``fqname`` against the installed package and capture it as a record.
+
+    Extends the module boundary along importable submodules first, then resolves the
+    remaining segments via ``getattr``. The only place that actually imports the
+    package — so on a cache hit upstream, the package is never imported. Fail-safe:
+    any uncertainty becomes an ``"unverifiable"`` record (the checks stay silent on it).
+    """
+    module = import_package(root_package)
+    if module is None:
+        return IntrospectionRecord(status="unverifiable")
+
+    segments = fqname.split(".")
+    obj: object = module
+    index = 1  # segments[0] is the root we just imported
+
+    while index < len(segments):
+        candidate = ".".join(segments[: index + 1])
+        result = try_import_submodule(candidate)
+        if result.status is SubmoduleStatus.OK:
+            obj = result.module
+            index += 1
+        elif result.status is SubmoduleStatus.NOT_A_MODULE:
+            break
+        else:  # BROKEN -> a real module that won't import cleanly
+            return IntrospectionRecord(status="unverifiable")
+
+    while index < len(segments):
+        segment = segments[index]
+        parent = obj
+        try:
+            obj = getattr(parent, segment)
+        except AttributeError:
+            if not is_introspectable_parent(parent):
+                return IntrospectionRecord(status="unverifiable")
+            return IntrospectionRecord(
+                status="absent",
+                missing_index=index,
+                missing_segment=segment,
+                suggestions=did_you_mean(segment, public_members(parent)),
+            )
+        except Exception:  # a descriptor/property that raises -> unverifiable, stay silent
+            return IntrospectionRecord(status="unverifiable")
+        index += 1
+
+    return _resolved_record(obj)
+
+
+def _resolved_record(obj: object) -> IntrospectionRecord:
+    signature = safe_signature(obj)
+    has_var_keyword = False
+    acceptable: tuple[str, ...] = ()
+    if signature is not None:
+        params = signature.parameters
+        has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        acceptable = tuple(
+            name
+            for name, param in params.items()
+            if param.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+    return IntrospectionRecord(
+        status="resolved",
+        has_signature=signature is not None,
+        has_var_keyword=has_var_keyword,
+        acceptable_keywords=acceptable,
+        deprecated_message=_deprecated_marker(obj),
+    )
