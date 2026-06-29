@@ -17,10 +17,17 @@ import difflib
 import importlib
 import importlib.metadata
 import inspect
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 from functools import cache
 from types import ModuleType
+
+#: The three verdicts a record can carry. ``resolved`` and ``absent`` are definitive;
+#: ``unverifiable`` means "could not be proven either way" and always resolves to silence.
+RESOLVED = "resolved"
+ABSENT = "absent"
+UNVERIFIABLE = "unverifiable"
+_VALID_STATUS = frozenset({RESOLVED, ABSENT, UNVERIFIABLE})
 
 
 @cache
@@ -106,7 +113,7 @@ def did_you_mean(name: str, candidates: list[str], *, limit: int = 3) -> tuple[s
     return tuple(difflib.get_close_matches(name, candidates, n=limit, cutoff=0.6))
 
 
-def safe_signature(obj: object) -> inspect.Signature | None:
+def safe_signature(obj: object, *, follow_wrapped: bool = True) -> inspect.Signature | None:
     """``inspect.signature(obj)`` or ``None`` if it cannot be introspected — fail-safe.
 
     The catch is deliberately broad. Beyond the documented ``ValueError`` /
@@ -114,11 +121,14 @@ def safe_signature(obj: object) -> inspect.Signature | None:
     ``signature()`` raise a *custom* exception of their own — e.g. openai 1.x's
     ``ChatCompletion`` raises ``APIRemovedInV1`` when introspected. Any such failure is
     unverifiable and must be silent, never a crash and never a flag.
+
+    ``follow_wrapped`` is threaded through so a caller can read a wrapper's *own* signature
+    (``follow_wrapped=False``) instead of the ``functools.wraps`` ``__wrapped__`` target.
     """
     if not callable(obj):
         return None
     try:
-        return inspect.signature(obj)
+        return inspect.signature(obj, follow_wrapped=follow_wrapped)
     except Exception:  # any failure, incl. custom proxy exceptions -> unverifiable
         return None
 
@@ -181,6 +191,72 @@ class IntrospectionRecord:
     deprecated_message: str | None = None  # PEP 702 marker; None => not deprecated
 
 
+def record_to_dict(record: IntrospectionRecord) -> dict[str, object]:
+    """Serialize a record to a JSON-safe dict (tuples become lists on the wire)."""
+    return asdict(record)
+
+
+def _str_tuple(value: object) -> tuple[str, ...] | None:
+    """``value`` as a tuple of strings, or ``None`` if it is not a list/tuple of strings."""
+    if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+        return tuple(value)
+    return None
+
+
+def record_from_dict(raw: object) -> IntrospectionRecord | None:
+    """Rebuild a record from untrusted JSON, returning ``None`` on ANY irregularity.
+
+    The single trust boundary for every serialized record — both on-disk cache entries
+    and subprocess-worker results pass through here. It validates the status, every
+    field's type, and the per-status invariants (an ``absent`` record must carry a real
+    ``missing_index``/``missing_segment``; a poisoned or partial entry must not). A
+    ``None`` means "do not trust this" — the caller re-introspects rather than risk a
+    wrong verdict from corrupt or forward-incompatible data.
+    """
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get("status")
+    if status not in _VALID_STATUS:
+        return None
+
+    if status == ABSENT:
+        missing_index = raw.get("missing_index")
+        missing_segment = raw.get("missing_segment")
+        suggestions = _str_tuple(raw.get("suggestions", ()))
+        # bool is an int subclass; a JSON true/false is never a valid index.
+        if not isinstance(missing_index, int) or isinstance(missing_index, bool):
+            return None
+        if missing_index < 0 or not isinstance(missing_segment, str) or not missing_segment:
+            return None
+        if suggestions is None:
+            return None
+        return IntrospectionRecord(
+            status=ABSENT,
+            missing_index=missing_index,
+            missing_segment=missing_segment,
+            suggestions=suggestions,
+        )
+
+    if status == RESOLVED:
+        has_signature = raw.get("has_signature", False)
+        has_var_keyword = raw.get("has_var_keyword", False)
+        acceptable = _str_tuple(raw.get("acceptable_keywords", ()))
+        deprecated = raw.get("deprecated_message")
+        if not isinstance(has_signature, bool) or not isinstance(has_var_keyword, bool):
+            return None
+        if acceptable is None or (deprecated is not None and not isinstance(deprecated, str)):
+            return None
+        return IntrospectionRecord(
+            status=RESOLVED,
+            has_signature=has_signature,
+            has_var_keyword=has_var_keyword,
+            acceptable_keywords=acceptable,
+            deprecated_message=deprecated,
+        )
+
+    return IntrospectionRecord(status=UNVERIFIABLE)
+
+
 def introspect_fqname(root_package: str, fqname: str) -> IntrospectionRecord:
     """Resolve ``fqname`` against the installed package and capture it as a record.
 
@@ -229,23 +305,52 @@ def introspect_fqname(root_package: str, fqname: str) -> IntrospectionRecord:
     return _resolved_record(obj)
 
 
+def _signature_kwargs(signature: inspect.Signature) -> tuple[bool, frozenset[str]]:
+    """``(declares **kwargs, names passable by keyword)`` for one signature."""
+    params = signature.parameters
+    has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    acceptable = frozenset(
+        name
+        for name, param in params.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    return has_var_keyword, acceptable
+
+
+def _keyword_signatures(obj: object) -> list[inspect.Signature]:
+    """The signature(s) to trust for keyword validity, or ``[]`` if it is ambiguous.
+
+    Normally just ``inspect.signature(obj)``. But ``functools.wraps`` sets ``__wrapped__``
+    and ``inspect.signature`` follows it by default — reporting the *wrapped* function's
+    parameters, which misrepresents a wrapper that adds or drops keywords and would
+    false-flag a perfectly valid call. So when ``__wrapped__`` is present we require BOTH
+    the followed and the unwrapped signatures, and the caller treats a keyword as valid if
+    *either* accepts it (only what both reject is flagged). If either signature cannot be
+    read the two cannot be reconciled, so introspection is ambiguous → ``[]`` → silence.
+    """
+    if not callable(obj):
+        return []
+    followed = safe_signature(obj)  # follow_wrapped=True (the default)
+    if not hasattr(obj, "__wrapped__"):
+        return [followed] if followed is not None else []
+    unwrapped = safe_signature(obj, follow_wrapped=False)
+    if followed is None or unwrapped is None:
+        return []
+    return [followed, unwrapped]
+
+
 def _resolved_record(obj: object) -> IntrospectionRecord:
-    signature = safe_signature(obj)
+    signatures = _keyword_signatures(obj)
     has_var_keyword = False
-    acceptable: tuple[str, ...] = ()
-    if signature is not None:
-        params = signature.parameters
-        has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-        acceptable = tuple(
-            name
-            for name, param in params.items()
-            if param.kind
-            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        )
+    acceptable: frozenset[str] = frozenset()
+    for signature in signatures:
+        var_keyword, names = _signature_kwargs(signature)
+        has_var_keyword = has_var_keyword or var_keyword
+        acceptable |= names  # union: a keyword valid in EITHER signature is not flagged
     return IntrospectionRecord(
-        status="resolved",
-        has_signature=signature is not None,
+        status=RESOLVED,
+        has_signature=bool(signatures),
         has_var_keyword=has_var_keyword,
-        acceptable_keywords=acceptable,
+        acceptable_keywords=tuple(sorted(acceptable)),
         deprecated_message=_deprecated_marker(obj),
     )

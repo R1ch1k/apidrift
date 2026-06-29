@@ -117,6 +117,20 @@ def test_verbose_surfaces_unreadable_file(
     assert "unreadable" in out
 
 
+def test_local_shadow_is_not_flagged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A sibling pandas.py shadows the installed pandas at runtime. `local_only` is absent
+    # in the INSTALLED pandas, but apidrift must not flag it against the wrong package.
+    (tmp_path / "pandas.py").write_text("def local_only():\n    return 1\n", encoding="utf-8")
+    app = tmp_path / "app.py"
+    app.write_text("import pandas\npandas.local_only()\n", encoding="utf-8")
+    code = main([str(app), "--no-cache"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "not found" not in out
+
+
 @pytest.mark.skipif(not _FIXTURE.exists(), reason="run from repo root")
 def test_fixture_demo_flags_four(capsys: pytest.CaptureFixture[str]) -> None:
     code = main([str(_FIXTURE)])

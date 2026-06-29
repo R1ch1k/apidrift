@@ -10,6 +10,7 @@ tolerable, a false alarm is not.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -24,6 +25,13 @@ from apidrift.resolver import ResolvedCall
 
 if TYPE_CHECKING:
     from apidrift.cache import IntrospectionCache
+
+#: How records are produced for a batch of ``(root_package, fqname)`` pairs. Injected so
+#: ``checks.py`` stays free of the subprocess machinery — the CLI passes the isolated
+#: worker (``apidrift.worker.introspect_batch``); a test may pass an in-process stand-in.
+IntrospectBatch = Callable[
+    [Sequence[tuple[str, str]]], dict[tuple[str, str], IntrospectionRecord]
+]
 
 
 class Severity(Enum):
@@ -79,6 +87,45 @@ def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> I
     return record
 
 
+def resolve_records(
+    calls: Sequence[ResolvedCall],
+    cache: IntrospectionCache | None,
+    introspect_batch: IntrospectBatch,
+) -> dict[tuple[str, str], IntrospectionRecord]:
+    """A ``(root_package, fqname) -> record`` map for every call, cache-first.
+
+    The whole run's introspection funnels through here: each distinct ``(root, fqname)``
+    is served from the cache when its version is known and present, and everything else
+    is gathered into a single ``introspect_batch`` call (one isolated subprocess per root,
+    importing each package once). New definitive records are written back to the cache.
+    This is the only path the CLI uses, so no package is ever imported in apidrift's own
+    process.
+    """
+    wanted = {(call.root_package, call.fqname) for call in calls}
+    versions = {root: package_version(root) for root, _ in wanted}
+
+    records: dict[tuple[str, str], IntrospectionRecord] = {}
+    misses: list[tuple[str, str]] = []
+    for key in wanted:
+        root, fqname = key
+        version = versions[root]
+        if cache is not None and version is not None:
+            cached = cache.get(root, version, fqname)
+            if cached is not None:
+                records[key] = cached
+                continue
+        misses.append(key)
+
+    if misses:
+        for key, record in introspect_batch(misses).items():
+            records[key] = record
+            root, fqname = key
+            version = versions[root]
+            if cache is not None and version is not None:
+                cache.put(root, version, fqname, record)  # put() ignores non-definitive records
+    return records
+
+
 # --------------------------------------------------------------------------- #
 # Check A — symbol existence
 # --------------------------------------------------------------------------- #
@@ -91,12 +138,18 @@ def _existence(call: ResolvedCall, record: IntrospectionRecord) -> Violation | N
     if record.status != "absent":
         return None
     segments = call.fqname.split(".")
+    index = record.missing_index
+    # Defense in depth: only flag from an absent record that is *consistent* with this
+    # call. A record whose index is out of range, or whose missing segment does not match
+    # the fqname, is malformed or poisoned — stay silent rather than emit a wrong symbol.
+    if not 0 <= index < len(segments) or segments[index] != record.missing_segment:
+        return None
     return Violation(
         check="existence",
         severity=Severity.ERROR,
         lineno=call.lineno,
         col_offset=call.col_offset,
-        symbol=".".join(segments[: record.missing_index + 1]),
+        symbol=".".join(segments[: index + 1]),
         token=record.missing_segment,
         package=call.root_package,
         version=package_version(call.root_package),
@@ -174,9 +227,8 @@ def _deprecation(call: ResolvedCall, record: IntrospectionRecord) -> Violation |
 # --------------------------------------------------------------------------- #
 # Aggregate — one record, all checks
 # --------------------------------------------------------------------------- #
-def check_call(call: ResolvedCall, cache: IntrospectionCache | None = None) -> list[Violation]:
-    """Run every check against one call from a single record; return all violations."""
-    record = record_for(call, cache)
+def run_checks(call: ResolvedCall, record: IntrospectionRecord) -> list[Violation]:
+    """Run every check against one call from an already-acquired record."""
     existence = _existence(call, record)
     if existence is not None:
         return [existence]  # an absent symbol short-circuits: no point checking it further
@@ -185,3 +237,13 @@ def check_call(call: ResolvedCall, cache: IntrospectionCache | None = None) -> l
     if deprecation is not None:
         violations.append(deprecation)
     return violations
+
+
+def check_call(call: ResolvedCall, cache: IntrospectionCache | None = None) -> list[Violation]:
+    """Run every check against one call, acquiring its record in-process (test/library API).
+
+    The CLI instead uses :func:`resolve_records` + :func:`run_checks` so all importing
+    happens in an isolated worker; this single-call form imports in-process and is kept
+    for unit tests and direct library use against known-safe packages.
+    """
+    return run_checks(call, record_for(call, cache))

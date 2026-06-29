@@ -1,10 +1,20 @@
 """Persistent per-(package, version) introspection cache.
 
-Stores :class:`IntrospectionRecord` data keyed by ``(package, version, fqname)`` under
-a platform-appropriate cache directory (stdlib only — no extra dependency). The version
-is part of the key, so a version bump can never serve a record introspected against a
-different installed version: it simply misses and re-introspects. That keying is the
-whole soundness story of the cache.
+Stores :class:`IntrospectionRecord` data keyed by ``(environment, package, version,
+fqname)`` under a platform-appropriate cache directory (stdlib only — no extra
+dependency). Two things make the cache *sound*, not just fast:
+
+* **Keying.** The installed version is in the key (a version bump misses and
+  re-introspects), and so is an *environment salt* — the interpreter, OS, and
+  architecture — because a record from one environment is not valid in another.
+* **Validation on read.** Every entry is re-validated through
+  :func:`~apidrift.introspect.record_from_dict`; a corrupt, partial, poisoned, or
+  forward-incompatible entry is treated as a miss, never trusted. A bad cache can slow a
+  run down (re-introspection) but can never change a verdict.
+
+Writes are a pure optimization and fail safe: an unwritable or blocked cache directory
+degrades to no-write (recorded in :attr:`IntrospectionCache.write_error`) and never
+crashes a scan.
 
 Only definitive verdicts (``resolved`` / ``absent``) are cached. ``unverifiable`` is
 never persisted — it is often transient (a temporarily broken environment), and not
@@ -12,26 +22,46 @@ caching it means a fixed environment is re-checked on the next run rather than s
 silent forever.
 
 Records are loaded per file lazily, held in memory for the run, and flushed once at the
-end, so a run touches each ``(package, version)`` file at most once for read and once
-for write.
+end, so a run touches each cache file at most once for read and once for write.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import sys
-from dataclasses import asdict, fields
 from pathlib import Path
 
-from apidrift.introspect import IntrospectionRecord
+from apidrift.introspect import (
+    ABSENT,
+    RESOLVED,
+    IntrospectionRecord,
+    record_from_dict,
+    record_to_dict,
+)
 
 _FORMAT = "v1"  # cache layout version; bump to invalidate everything on a format change
 
-_Table = dict[str, dict[str, object]]
-_FIELDS = {f.name for f in fields(IntrospectionRecord)}
-_TUPLE_FIELDS = ("suggestions", "acceptable_keywords")
+_Table = dict[str, object]
+
+
+def _environment_salt() -> str:
+    """A key namespace for the *running* interpreter + platform.
+
+    A record introspected under one interpreter/OS/architecture is not valid for another
+    (different builtins, C-extension shapes, even namespace-package layouts), so it must
+    never be served across them. Folding this into the cache path makes a foreign-env
+    record simply miss rather than mislead — bare ``(package, version)`` keys are unsafe.
+    """
+    parts = (
+        platform.python_implementation(),
+        platform.python_version(),
+        sys.platform,
+        platform.machine() or "unknown",
+    )
+    return _slug("-".join(parts))
 
 
 def default_cache_dir() -> Path:
@@ -53,29 +83,49 @@ class IntrospectionCache:
 
     def __init__(self, root: Path | None = None) -> None:
         self._root = root if root is not None else default_cache_dir()
+        self._salt = _environment_salt()  # captured per instance (and so monkeypatchable)
         self._tables: dict[tuple[str, str], _Table] = {}
         self._dirty: set[tuple[str, str]] = set()
+        #: Set by :meth:`flush` when the cache could not be written (e.g. the cache dir is
+        #: blocked or points at a file). The scan still completes; the cache just degrades
+        #: to no-write. Surfaced under ``--verbose`` and otherwise silent.
+        self.write_error: str | None = None
 
     def get(self, package: str, version: str, fqname: str) -> IntrospectionRecord | None:
-        raw = self._table(package, version).get(fqname)
-        return _deserialize(raw) if raw is not None else None
+        """The validated record for a key, or ``None`` (a miss) on absence OR irregularity.
+
+        Every entry is re-validated through :func:`record_from_dict`, so a corrupt,
+        partial, poisoned, or forward-incompatible entry is indistinguishable from a miss:
+        it is re-introspected rather than trusted. A bad cache can never produce a verdict.
+        """
+        return record_from_dict(self._table(package, version).get(fqname))
 
     def put(self, package: str, version: str, fqname: str, record: IntrospectionRecord) -> None:
         # Only definitive verdicts are worth persisting (see module docstring).
-        if record.status not in ("resolved", "absent"):
+        if record.status not in (RESOLVED, ABSENT):
             return
-        self._table(package, version)[fqname] = asdict(record)
+        self._table(package, version)[fqname] = record_to_dict(record)
         self._dirty.add((package, version))
 
     def flush(self) -> None:
-        """Write back every table modified this run (atomically per file)."""
-        for key in self._dirty:
-            path = self._path(*key)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps(self._tables[key]), encoding="utf-8")
-            tmp.replace(path)
-        self._dirty.clear()
+        """Write back every modified table (atomically per file), failing safe.
+
+        Persisting the cache is a pure optimization: if the cache directory is unwritable
+        or blocked (e.g. ``APIDRIFT_CACHE_DIR`` points at an existing file), the write is
+        abandoned and recorded in :attr:`write_error` — the scan's result is unaffected.
+        A cache write must never crash a run.
+        """
+        try:
+            for key in self._dirty:
+                path = self._path(*key)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_text(json.dumps(self._tables[key]), encoding="utf-8")
+                tmp.replace(path)
+        except Exception as exc:  # deliberate fail-safe: degrade to no-write, never raise
+            self.write_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._dirty.clear()
 
     def clear(self) -> None:
         """Delete the entire on-disk cache."""
@@ -91,7 +141,7 @@ class IntrospectionCache:
         return self._tables[key]
 
     def _path(self, package: str, version: str) -> Path:
-        return self._root / _FORMAT / _slug(package) / f"{_slug(version)}.json"
+        return self._root / _FORMAT / self._salt / _slug(package) / f"{_slug(version)}.json"
 
 
 def _slug(text: str) -> str:
@@ -103,22 +153,5 @@ def _read(path: Path) -> _Table:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}  # missing or corrupt cache file -> treat as empty (fail-safe)
+        return {}  # missing, unreadable, or corrupt cache file -> treat as empty (fail-safe)
     return data if isinstance(data, dict) else {}
-
-
-def _deserialize(raw: dict[str, object]) -> IntrospectionRecord | None:
-    """Rebuild a record from JSON, tolerating corrupt/forward-incompatible entries.
-
-    Returns ``None`` on any mismatch so the caller falls back to a fresh introspection —
-    a bad cache entry must never produce a wrong verdict.
-    """
-    payload = {key: raw[key] for key in _FIELDS if key in raw}
-    for key in _TUPLE_FIELDS:
-        value = payload.get(key)
-        if isinstance(value, list):
-            payload[key] = tuple(value)
-    try:
-        return IntrospectionRecord(**payload)  # type: ignore[arg-type]
-    except TypeError:
-        return None

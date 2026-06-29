@@ -204,6 +204,21 @@ def test_positional_only_passed_by_keyword_flags() -> None:
     assert tokens == {"a", "b"}
 
 
+def test_functools_wraps_added_keyword_is_silent() -> None:
+    # functools.wraps makes signature() follow __wrapped__ to a function without `new_kw`;
+    # consulting the wrapper's own signature too keeps this valid call silent.
+    source = "import legacy_lib\nlegacy_lib.wrapped_adds_kwarg(1, 2, new_kw=3)\n"
+    assert _kw_violations(source) == []
+
+
+def test_functools_wraps_genuinely_bad_keyword_still_flags() -> None:
+    # A keyword that NEITHER the wrapper nor the wrapped function accepts is still a real
+    # error — the __wrapped__ leniency must not suppress genuine drift.
+    source = "import legacy_lib\nlegacy_lib.wrapped_adds_kwarg(1, 2, totally_bogus=9)\n"
+    (violation,) = _kw_violations(source)
+    assert violation.token == "totally_bogus"
+
+
 # --------------------------------------------------------------------------- #
 # Check C (PEP 702 __deprecated__ deprecation)
 # --------------------------------------------------------------------------- #

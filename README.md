@@ -40,13 +40,7 @@ versions.
 ## Install
 
 ```bash
-pip install apidrift          # PyPI release pending — see "from source" below
-```
-
-Until the first PyPI release, install from source (works once the repo is public):
-
-```bash
-pip install git+https://github.com/R1ch1k/apidrift
+pip install apidrift
 ```
 
 **Important:** apidrift checks calls against the versions of your dependencies that are

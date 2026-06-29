@@ -47,6 +47,7 @@ class SkipReason(Enum):
     WILDCARD = "bare name may originate from a wildcard import"
     STDLIB = "stdlib module (out of scope for v0)"
     NOT_INSTALLED = "package not installed in this environment"
+    LOCAL_SHADOW = "shadowed by a local module/package of the same name"
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ def build_import_table(tree: ast.Module) -> ImportTable:
     names: dict[str, ImportedName] = {}
     conflicts: set[str] = set()
     wildcard: list[str] = []
+    wildcard_lines: list[int] = []
     relative: set[str] = set()
 
     for node in ast.walk(tree):
@@ -157,6 +159,7 @@ def build_import_table(tree: ast.Module) -> ImportTable:
             for alias in node.names:
                 if alias.name == "*":
                     wildcard.append(module)
+                    wildcard_lines.append(node.lineno)
                     continue
                 local = alias.asname or alias.name
                 base = f"{module}.{alias.name}"
@@ -165,6 +168,16 @@ def build_import_table(tree: ast.Module) -> ImportTable:
     # Soundness: a name that is ambiguous or reassigned cannot be trusted.
     for name in conflicts | _reassigned_names(tree):
         names.pop(name, None)
+
+    # A `from x import *` can silently rebind any name bound at or before it. We cannot see
+    # the wildcard's exports without importing, so we conservatively drop every imported
+    # name a wildcard could overwrite (bound on a line <= the last wildcard). Names bound
+    # strictly after every wildcard are clearly safe and kept.
+    if wildcard_lines:
+        last_wildcard = max(wildcard_lines)
+        for name, entry in list(names.items()):
+            if entry.lineno <= last_wildcard:
+                del names[name]
 
     return ImportTable(
         names=names,
@@ -189,12 +202,17 @@ def _reassigned_names(tree: ast.Module) -> set[str]:
 
     Import statements do not produce ``Store`` ``Name`` nodes, so an imported alias
     only appears here if the code rebinds it — in which case its target is no longer
-    trustworthy and we drop it. ``def``, ``async def`` and ``class`` bind their name
-    via the node's ``.name`` string (no ``Store`` ``Name`` node either), so they must
-    be collected explicitly — otherwise a local ``def read_csv(...)`` would shadow
-    ``from pandas import read_csv`` and the resolver would wrongly target
-    ``pandas.read_csv`` on the user's own function. Whole-module scope is fine:
-    over-dropping only costs recall, never soundness.
+    trustworthy and we drop it. Several binding forms bind a name via a node ``.name``
+    *string* rather than a ``Store`` ``Name`` node, so they must be collected explicitly,
+    or a local binding would shadow an import and the resolver would wrongly target the
+    third-party symbol on the user's own name:
+
+    * ``def`` / ``async def`` / ``class`` — ``node.name``;
+    * ``except E as name`` — ``ExceptHandler.name``;
+    * match capture patterns — ``case name`` / ``case ... as name`` (``MatchAs.name``),
+      ``case [*rest]`` (``MatchStar.name``), ``case {**rest}`` (``MatchMapping.rest``).
+
+    Whole-module scope is fine: over-dropping only costs recall, never soundness.
     """
     assigned: set[str] = set()
     for node in ast.walk(tree):
@@ -202,9 +220,34 @@ def _reassigned_names(tree: ast.Module) -> set[str]:
             assigned.add(node.id)
         elif isinstance(node, ast.arg):
             assigned.add(node.arg)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            assigned.add(node.name)
+        else:
+            bound = _string_bound_name(node)
+            if bound:
+                assigned.add(bound)
     return assigned
+
+
+def _string_bound_name(node: ast.AST) -> str | None:
+    """The name a node binds via a ``.name``/``.rest`` *string* (no ``Store`` Name node).
+
+    Covers ``def``/``async def``/``class``, ``except E as name``, and the match capture
+    patterns (``case name`` / ``... as name``, ``case [*rest]``, ``case {**rest}``).
+    """
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.ExceptHandler,
+            ast.MatchAs,
+            ast.MatchStar,
+        ),
+    ):
+        return node.name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -213,12 +256,16 @@ def _reassigned_names(tree: ast.Module) -> set[str]:
 def resolve_calls(
     tree: ast.Module,
     table: ImportTable,
+    local_shadows: frozenset[str] = frozenset(),
 ) -> tuple[list[ResolvedCall], list[SkippedCall]]:
     """Resolve every call in the tree against the import table.
 
     Returns ``(resolved, skipped)``. Only calls rooting at an imported, installed,
     third-party package land in ``resolved``; everything else is skipped (with a
     reason recorded when it is informative enough to show under ``--verbose``).
+    ``local_shadows`` names roots that a sibling file shadows at runtime — those are
+    skipped, since the installed package apidrift would introspect is not the one that
+    actually loads.
     """
     resolved: list[ResolvedCall] = []
     skipped: list[SkippedCall] = []
@@ -243,6 +290,14 @@ def resolve_calls(
         fqname = imported.base_fqname
         if attrs:
             fqname = f"{fqname}." + ".".join(attrs)
+
+        if imported.root_package in local_shadows:
+            # A sibling `pandas.py` / `pandas/` wins at import time; the installed package
+            # we could introspect is the wrong one, so we cannot judge this call.
+            skipped.append(
+                SkippedCall(fqname, SkipReason.LOCAL_SHADOW, node.lineno, node.col_offset)
+            )
+            continue
 
         kind = classify_root(imported.root_package)
         if kind is RootKind.STDLIB:
@@ -344,6 +399,32 @@ def _empty_resolution(
     )
 
 
+def _local_shadowed_roots(path: str, table: ImportTable) -> frozenset[str]:
+    """Imported roots that a sibling module/package of the same name shadows at runtime.
+
+    The scanned file's own directory is first on ``sys.path`` when it runs, so a sibling
+    ``pandas.py`` or ``pandas/`` package beats the *installed* pandas. apidrift introspects
+    the installed one, so a local shadow would make it judge the wrong package — we skip
+    such roots instead (sound over complete). Only meaningful for a real on-disk file;
+    a ``<unknown>`` source (a string with no location) cannot be checked, so nothing is
+    shadowed. Filesystem probing is fail-safe: an error just means "not shadowed".
+    """
+    if path == "<unknown>":
+        return frozenset()
+    try:
+        parent = Path(path).parent
+    except (OSError, ValueError):
+        return frozenset()
+    shadowed: set[str] = set()
+    for root in {imported.root_package for imported in table.names.values()}:
+        try:
+            if (parent / f"{root}.py").is_file() or (parent / root).is_dir():
+                shadowed.add(root)
+        except OSError:  # an unstattable sibling is simply not treated as a shadow
+            continue
+    return frozenset(shadowed)
+
+
 def resolve_source(source: str, path: str = "<unknown>") -> FileResolution:
     """Parse and resolve a source string. Syntax errors are captured, not raised."""
     try:
@@ -351,7 +432,7 @@ def resolve_source(source: str, path: str = "<unknown>") -> FileResolution:
     except SyntaxError as exc:
         return _empty_resolution(path, syntax_error=exc)
     table = build_import_table(tree)
-    resolved, skipped = resolve_calls(tree, table)
+    resolved, skipped = resolve_calls(tree, table, _local_shadowed_roots(path, table))
     return FileResolution(
         path=path,
         resolved=tuple(resolved),

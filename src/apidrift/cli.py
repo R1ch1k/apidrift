@@ -19,9 +19,10 @@ from pathlib import Path
 
 from apidrift import __version__
 from apidrift.cache import IntrospectionCache, default_cache_dir
-from apidrift.checks import Severity, Violation, check_call
+from apidrift.checks import Severity, Violation, resolve_records, run_checks
 from apidrift.report import render_json, render_report
 from apidrift.resolver import FileResolution, resolve_file
+from apidrift.worker import introspect_batch
 
 _GLOB_CHARS = "*?["
 
@@ -47,13 +48,6 @@ def collect_python_files(paths: Sequence[str]) -> list[Path]:
                 files.append(candidate)
 
     return files
-
-
-def _check(resolution: FileResolution, cache: IntrospectionCache | None) -> list[Violation]:
-    violations: list[Violation] = []
-    for call in resolution.resolved:
-        violations.extend(check_call(call, cache))
-    return violations
 
 
 def _configure_utf8() -> None:
@@ -124,11 +118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cache = None if args.no_cache else IntrospectionCache()
 
-    per_file: list[tuple[str, Sequence[Violation]]] = []
-    total_checked = 0
+    # Pass 1: resolve every file (capturing, never raising on a bad file).
+    resolutions: list[FileResolution] = []
     total_skipped = 0
     verbose_lines: list[str] = []
-
     for path in files:
         resolution = resolve_file(path)
         if resolution.read_error is not None:
@@ -145,11 +138,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{resolution.path}: skipped file (syntax error: {resolution.syntax_error.msg})"
                 )
             continue
-
-        per_file.append((resolution.path, _check(resolution, cache)))
-        total_checked += len(resolution.resolved)
+        resolutions.append(resolution)
         total_skipped += len(resolution.skipped)
-
         if args.verbose:
             for skip in sorted(resolution.skipped, key=lambda s: (s.lineno, s.col_offset)):
                 verbose_lines.append(
@@ -157,8 +147,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"({skip.reason.value})"
                 )
 
+    # Acquire every record up front: cache hits, then one isolated worker per remaining
+    # root package (so no third-party code is ever imported in apidrift's own process).
+    all_calls = [call for resolution in resolutions for call in resolution.resolved]
+    records = resolve_records(all_calls, cache, introspect_batch)
+
+    # Pass 2: run the checks from the acquired records (pure; no importing here).
+    per_file: list[tuple[str, Sequence[Violation]]] = []
+    total_checked = 0
+    for resolution in resolutions:
+        violations: list[Violation] = []
+        for call in resolution.resolved:
+            record = records.get((call.root_package, call.fqname))
+            if record is not None:
+                violations.extend(run_checks(call, record))
+        per_file.append((resolution.path, violations))
+        total_checked += len(resolution.resolved)
+
     if cache is not None:
         cache.flush()
+        if args.verbose and cache.write_error is not None:
+            verbose_lines.append(f"cache: not written ({cache.write_error})")
 
     if args.json:
         print(render_json(per_file))

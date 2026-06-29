@@ -185,6 +185,56 @@ def test_wildcard_bare_name_is_refused() -> None:
     assert "read_exel" in _skips_by_reason(source)[SkipReason.WILDCARD]
 
 
+def test_except_as_shadow_is_dropped() -> None:
+    # `except Exception as read_csv` rebinds the imported name (ExceptHandler.name, a
+    # string with no Store node) -> the import target is no longer trustworthy -> drop.
+    source = (
+        "from pandas import read_csv\n"
+        "try:\n"
+        "    pass\n"
+        "except Exception as read_csv:\n"
+        "    pass\n"
+        "read_csv('x')\n"
+    )
+    assert _fqnames(source) == set()
+
+
+def test_match_capture_shadow_is_dropped() -> None:
+    # `case read_csv:` is a capture pattern that binds `read_csv` (MatchAs.name).
+    source = (
+        "from pandas import read_csv\n"
+        "match object():\n"
+        "    case read_csv:\n"
+        "        pass\n"
+        "read_csv('x')\n"
+    )
+    assert _fqnames(source) == set()
+
+
+def test_match_as_shadow_is_dropped() -> None:
+    # `case [_] as read_csv:` binds `read_csv` via the `as` of a MatchAs pattern.
+    source = (
+        "from pandas import read_csv\n"
+        "match object():\n"
+        "    case [_] as read_csv:\n"
+        "        pass\n"
+        "read_csv('x')\n"
+    )
+    assert _fqnames(source) == set()
+
+
+def test_star_import_after_binding_drops_rebindable_name() -> None:
+    # A later `from x import *` can silently rebind read_csv -> drop it (silence).
+    source = "from pandas import read_csv\nfrom somemod_zzz import *\nread_csv('x')\n"
+    assert _fqnames(source) == set()
+
+
+def test_star_import_before_binding_keeps_safe_name() -> None:
+    # The explicit import comes AFTER every wildcard, so nothing rebinds it -> keep it.
+    source = "from somemod_zzz import *\nfrom pandas import read_csv\nread_csv('x')\n"
+    assert _fqnames(source) == {"pandas.read_csv"}
+
+
 def test_stdlib_is_skipped() -> None:
     source = "import os\nos.getcwd()\n"
     assert _fqnames(source) == set()
@@ -282,3 +332,38 @@ def test_null_byte_file_degrades_cleanly(tmp_path: Path) -> None:
     assert result.read_error is None
     assert result.syntax_error is not None
     assert result.resolved == ()
+
+
+# --------------------------------------------------------------------------- #
+# Local shadowing — a sibling module/package wins at runtime, so skip that root.
+# (Resolution-only: needs the file's real directory, so it goes through resolve_file.)
+# --------------------------------------------------------------------------- #
+def test_local_module_shadow_skips_the_root(tmp_path: Path) -> None:
+    # A sibling `pandas.py` shadows the installed pandas; `pandas.local_only` must NOT
+    # resolve to the installed package (where it does not exist -> would false-flag).
+    (tmp_path / "pandas.py").write_text("def local_only():\n    return 1\n", encoding="utf-8")
+    app = tmp_path / "app.py"
+    app.write_text("import pandas\npandas.local_only()\n", encoding="utf-8")
+    result = resolve_file(app)
+    assert result.resolved == ()
+    assert any(s.reason is SkipReason.LOCAL_SHADOW for s in result.skipped)
+
+
+def test_local_package_dir_shadow_skips_the_root(tmp_path: Path) -> None:
+    pkg = tmp_path / "pandas"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    app = tmp_path / "app.py"
+    app.write_text("import pandas\npandas.local_only()\n", encoding="utf-8")
+    result = resolve_file(app)
+    assert result.resolved == ()
+    assert any(s.reason is SkipReason.LOCAL_SHADOW for s in result.skipped)
+
+
+def test_no_sibling_means_installed_package_resolves(tmp_path: Path) -> None:
+    # Control: with no local shadow, the same call resolves normally — proving the skip
+    # above is the shadow's doing, not an artifact of scanning a temp directory.
+    app = tmp_path / "app.py"
+    app.write_text("import pandas\npandas.read_csv('x')\n", encoding="utf-8")
+    result = resolve_file(app)
+    assert {c.fqname for c in result.resolved} == {"pandas.read_csv"}

@@ -7,6 +7,7 @@ checks must handle correctly.
 
 from __future__ import annotations
 
+import functools
 import warnings
 
 from typing_extensions import deprecated
@@ -15,6 +16,23 @@ from typing_extensions import deprecated
 def normal(x: int, y: int) -> tuple[int, int]:
     """Ordinary positional-or-keyword parameters."""
     return (x, y)
+
+
+def _wrapped_base(a: int, b: int) -> tuple[int, ...]:
+    """The wrapped target — note it has no ``new_kw`` parameter."""
+    return (a, b)
+
+
+@functools.wraps(_wrapped_base)
+def wrapped_adds_kwarg(a: int, b: int, new_kw: int = 0) -> tuple[int, ...]:
+    """A ``functools.wraps`` wrapper that ADDS a keyword the wrapped function lacks.
+
+    ``inspect.signature`` follows ``__wrapped__`` to ``_wrapped_base(a, b)`` and would
+    falsely reject ``new_kw``. Check B must also consult the wrapper's own (unwrapped)
+    signature and stay silent on ``new_kw`` — while still flagging a keyword *neither*
+    signature accepts.
+    """
+    return (a, b, new_kw)
 
 
 def positional_only(a: int, b: int, /, c: int) -> tuple[int, int, int]:
