@@ -163,3 +163,45 @@ def test_missing_tempdir_is_unverifiable_not_a_crash(
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "does-not-exist"))
     records = introspect_batch([("pandas", "pandas.read_csv")])
     assert records[("pandas", "pandas.read_csv")].status == "unverifiable"
+
+
+# --------------------------------------------------------------------------- #
+# FIX 2 (re-audit) — launch with -S + a controlled bootstrap path, so nothing of the
+# project's runs before the worker binds its primitives, without breaking real resolution.
+# --------------------------------------------------------------------------- #
+def test_worker_launched_with_dash_S_and_controlled_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    import apidrift
+    from apidrift import worker as worker_mod
+
+    captured: dict[str, object] = {}
+    real_popen = worker_mod.subprocess.Popen
+
+    def spy_popen(args: object, **kwargs: object) -> object:
+        captured["args"] = list(args)  # type: ignore[call-overload]
+        captured["env"] = kwargs.get("env")
+        return real_popen(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worker_mod.subprocess, "Popen", spy_popen)
+    records = introspect_batch([("pandas", "pandas.read_csv")])
+
+    assert records[("pandas", "pandas.read_csv")].status == "resolved"  # real resolution intact
+    assert "-S" in captured["args"]  # type: ignore[operator]
+    bootstrap = str(Path(apidrift.__file__).resolve().parent.parent)
+    assert captured["env"]["PYTHONPATH"] == bootstrap  # type: ignore[index]  # controlled, not full
+
+
+def test_dash_S_does_not_run_project_sitecustomize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A project sitecustomize.py would, under default startup, run BEFORE the worker binds its
+    # primitives (the easiest pre-binding patch vector). With -S it never runs — proven by the
+    # absent marker — while the package on the pinned sys.path still introspects correctly.
+    marker = tmp_path / "sitecustomize_ran.txt"
+    (tmp_path / "sitecustomize.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8"
+    )
+    (tmp_path / "sitec_victim_zzz.py").write_text("def go():\n    return 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    records = introspect_batch([("sitec_victim_zzz", "sitec_victim_zzz.go")])
+    assert records[("sitec_victim_zzz", "sitec_victim_zzz.go")].status == "resolved"
+    assert not marker.exists()  # sitecustomize did NOT run before the worker

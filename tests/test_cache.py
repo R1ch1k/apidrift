@@ -255,3 +255,46 @@ def test_resolve_records_clean_hit_skips_the_worker(tmp_path: Path) -> None:
 
     records = resolve_records([call], cache, boom)
     assert records[("pandas", "pandas.read_csv")].status == "resolved"
+
+
+# --------------------------------------------------------------------------- #
+# FIX 1 (re-audit): in-process re-confirmation routes through the isolated worker, so a
+# package that exits or hangs on import degrades to silence instead of crashing/hanging.
+# (Force a version via monkeypatch so the fake package is cacheable and re-confirmation fires.)
+# --------------------------------------------------------------------------- #
+def test_reconfirm_sys_exit_import_is_silent_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cached would-be flag re-confirms via the worker; the package sys.exit()s on import
+    # (SystemExit — a BaseException an in-process import would NOT catch) -> unverifiable.
+    (tmp_path / "reexit_pkg_zzz.py").write_text("import sys\nsys.exit(5)\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr("apidrift.checks.package_version", lambda root: "1.0.0")
+    cache = IntrospectionCache(tmp_path / "c")
+    cache.put(
+        "reexit_pkg_zzz",
+        "1.0.0",
+        "reexit_pkg_zzz.go",
+        IntrospectionRecord(status="absent", missing_index=1, missing_segment="go"),
+    )
+    call = _one_call("import reexit_pkg_zzz as r\nr.go()\n")
+    assert check_call(call, cache) == []  # re-confirm -> worker import exits -> silent, no crash
+
+
+def test_reconfirm_hanging_import_times_out_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The hang case an in-process fail-safe could not catch: only the worker's timeout can.
+    (tmp_path / "rehang_pkg_zzz.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr("apidrift.checks.package_version", lambda root: "1.0.0")
+    monkeypatch.setattr("apidrift.worker.IMPORT_TIMEOUT_SECONDS", 1.0)  # don't wait the budget
+    cache = IntrospectionCache(tmp_path / "c")
+    cache.put(
+        "rehang_pkg_zzz",
+        "1.0.0",
+        "rehang_pkg_zzz.go",
+        IntrospectionRecord(status="absent", missing_index=1, missing_segment="go"),
+    )
+    call = _one_call("import rehang_pkg_zzz as r\nr.go()\n")
+    assert check_call(call, cache) == []  # worker killed at 1s -> unverifiable -> silent

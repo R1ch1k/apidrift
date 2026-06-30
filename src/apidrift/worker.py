@@ -44,10 +44,10 @@ from apidrift.introspect import (
 #: Wall-clock budget for importing + introspecting ONE root package. A package whose
 #: import hangs (or is pathologically slow) past this is killed and treated as
 #: unverifiable. Per package, not per run — a clean package never waits on a slow one.
-#: Trimmed from 15s to bound the worst-case "looks hung" wait on a cold run of several
-#: uncached packages; heavy but legitimate imports (torch/tensorflow) still fit, and one
-#: that genuinely exceeds it degrades to unverifiable (silent), never a false alarm.
-IMPORT_TIMEOUT_SECONDS = 8.0
+#: 12s balances bounding the worst-case "looks hung" wait on a cold run against not timing
+#: out a legitimately-slow import (8s was too tight — a ~8.4s import fell to silence). The
+#: real fix (bounded-concurrency workers + a global time budget) is backlog, not a launch gate.
+IMPORT_TIMEOUT_SECONDS = 12.0
 
 _UNVERIFIABLE = IntrospectionRecord(status=UNVERIFIABLE)
 
@@ -102,7 +102,9 @@ def _run_worker(root: str, fqnames: list[str], timeout: float) -> dict[str, Intr
             }
         )
         proc = subprocess.Popen(
-            [sys.executable, "-m", "apidrift.worker"],
+            # -S: no site / sitecustomize / .pth auto-run, so nothing of the project's gets a
+            # chance to patch the worker before it binds its serialization primitives (FIX 2).
+            [sys.executable, "-S", "-m", "apidrift.worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,  # suppress any import-time stdout from the package
             stderr=subprocess.DEVNULL,  # ...and stderr (warnings) — never leak to the parent
@@ -126,16 +128,23 @@ def _run_worker(root: str, fqnames: list[str], timeout: float) -> dict[str, Intr
 
 
 def _worker_env() -> dict[str, str]:
-    """The child's environment, with the parent's ``sys.path`` folded into ``PYTHONPATH``.
+    """The child's environment, carrying ONLY the path needed to import apidrift itself.
 
-    ``python -m apidrift.worker`` must be able to import apidrift before it can read its
-    request, so the parent's import roots are made available up front. The worker then
-    pins ``sys.path`` exactly from the request for faithful user-package resolution.
+    The worker is launched with ``-S`` (no ``site`` / ``sitecustomize`` / ``.pth`` auto-run),
+    so it boots from a controlled path — just the directory that contains the ``apidrift``
+    package, enough for ``python -S -m apidrift.worker`` to start — rather than inheriting the
+    parent's whole ``PYTHONPATH``. The worker then pins ``sys.path`` exactly from the request
+    for faithful user-package resolution, so it never relies on the ambient ``PYTHONPATH``.
+
+    This closes the easiest pre-binding patch vector: a project ``sitecustomize`` that would
+    otherwise run at interpreter startup, before the worker binds its serialization primitives.
+    It is hardening, not a complete forgery defense — see ``SECURITY.md`` for the threat model.
     """
+    import apidrift
+
+    bootstrap = str(Path(apidrift.__file__).resolve().parent.parent)
     env = dict(os.environ)
-    parent_path = os.pathsep.join(entry for entry in sys.path if isinstance(entry, str) and entry)
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join(part for part in (parent_path, existing) if part)
+    env["PYTHONPATH"] = bootstrap
     return env
 
 

@@ -72,9 +72,13 @@ def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> I
     cache, a record is served by ``(package, version, fqname)`` — but a cached record may
     never *flag* on its own (tenet: a cached value that lies must never produce a finding).
     So the asymmetry: a cached record that resolves to silence for this call is served fast
-    (no import), while a cached record that would emit a diagnostic is RE-CONFIRMED by live
-    introspection before it is trusted — re-introspection overwrites any poison and is what
-    actually gets reported. A genuine drift survives re-confirmation and still flags.
+    (no import), while a cached record that would emit a diagnostic is RE-CONFIRMED before it
+    is trusted — re-confirmation overwrites any poison and is what actually gets reported. A
+    genuine drift survives re-confirmation and still flags.
+
+    Re-confirmation runs through the SAME isolated worker as the CLI path, not in-process, so
+    a package that calls ``sys.exit()`` (a ``BaseException``) or hangs on import degrades to
+    unverifiable (silent) instead of crashing or hanging this process — one isolation boundary.
     """
     if cache is None:
         return introspect_fqname(call.root_package, call.fqname)
@@ -89,10 +93,13 @@ def record_for(call: ResolvedCall, cache: IntrospectionCache | None = None) -> I
         cache.put(call.root_package, version, call.fqname, record)
         return record
 
-    # Cache hit. Serve silence fast; re-confirm anything that would cry wolf.
+    # Cache hit. Serve silence fast; re-confirm anything that would cry wolf — in the worker.
     if not run_checks(call, cached):
         return cached
-    fresh = introspect_fqname(call.root_package, call.fqname)
+    from apidrift.worker import introspect_batch  # lazy: keep module load free of the worker
+
+    key = (call.root_package, call.fqname)
+    fresh = introspect_batch([key])[key]  # batch always answers every requested pair
     cache.put(call.root_package, version, call.fqname, fresh)  # overwrite any poisoned entry
     return fresh
 
