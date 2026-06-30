@@ -340,13 +340,23 @@ def test_arbitrary_read_error_is_captured_not_raised(
 
 
 def test_null_byte_file_degrades_cleanly(tmp_path: Path) -> None:
-    # A NUL byte is valid UTF-8 but not valid source -> handled as a syntax error
-    # (captured), never a read_error and never a raise.
+    # A NUL byte is valid UTF-8 but not valid source. ast.parse raises SyntaxError for it from
+    # 3.12 on, but ValueError on 3.10/3.11 — either way it must degrade cleanly (captured, never
+    # raised), so assert the version-agnostic property rather than a specific channel.
     f = tmp_path / "nul.py"
     f.write_bytes(b"x = 1\x00\ny = 2\n")
     result = resolve_file(f)
-    assert result.read_error is None
-    assert result.syntax_error is not None
+    assert (result.syntax_error is not None) or (result.read_error is not None)
+    assert result.resolved == ()
+
+
+def test_deeply_nested_source_degrades_cleanly() -> None:
+    # ast.parse raises MemoryError/RecursionError (not SyntaxError) on pathologically deep input.
+    # This must be captured like any other bad parse, never raised — a single bad file may not
+    # abort the run. (50_000 unary minuses overflow the parser stack on CPython.)
+    result = resolve_source("-" * 50_000 + "1", "deep.py")
+    assert result.read_error is not None
+    assert result.syntax_error is None
     assert result.resolved == ()
 
 

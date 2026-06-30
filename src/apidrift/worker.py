@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -83,16 +84,25 @@ def introspect_batch(
 def _run_worker(root: str, fqnames: list[str], timeout: float) -> dict[str, IntrospectionRecord]:
     """Run one worker for ``root`` over ``fqnames``; ``{}`` (all unverifiable) on any failure.
 
-    Creating the result temp file is *inside* the fail-safe too: a missing or unusable temp
-    directory (a bad ``TMPDIR`` / ``tempfile.tempdir``) makes this batch unverifiable, never a
-    crash before the guard. ``result_path`` stays ``None`` until creation succeeds so the
-    ``finally`` cleanup only runs when there is something to unlink.
+    Creating the result temp file AND the empty spawn-cwd directory are *inside* the fail-safe
+    too: a missing or unusable temp directory (a bad ``TMPDIR`` / ``tempfile.tempdir``) makes the
+    ``mkstemp`` or ``mkdtemp`` call raise, which becomes unverifiable, never a crash before the
+    guard. ``result_path`` / ``cwd_dir`` stay ``None`` until each creation succeeds so the
+    ``finally`` cleanup only runs when there is something to remove.
     """
     result_path: Path | None = None
+    cwd_dir: str | None = None
     try:
         result_fd, result_name = tempfile.mkstemp(prefix="apidrift-", suffix=".json")
         os.close(result_fd)  # the worker reopens it by path; we only needed a unique name
         result_path = Path(result_name)
+        # A freshly-created EMPTY directory to be the worker's cwd. `-m` puts the cwd first on
+        # the worker's sys.path and `-S` does NOT remove it, so a stdlib-shadowing file in the
+        # directory apidrift happens to run from (e.g. a planted ``json.py`` in a scanned repo)
+        # would be imported and execute during startup. Spawning in an empty dir means there is
+        # nothing there to shadow. Safe: the request's sys_path and result_path are absolute, so
+        # the worker's cwd is irrelevant to resolution.
+        cwd_dir = tempfile.mkdtemp(prefix="apidrift-cwd-")
         request = json.dumps(
             {
                 "sys_path": [entry for entry in sys.path if isinstance(entry, str)],
@@ -102,12 +112,15 @@ def _run_worker(root: str, fqnames: list[str], timeout: float) -> dict[str, Intr
             }
         )
         proc = subprocess.Popen(
-            # -S: no site / sitecustomize / .pth auto-run, so nothing of the project's gets a
-            # chance to patch the worker before it binds its serialization primitives (FIX 2).
+            # Hardened startup: -S disables site / sitecustomize / .pth auto-run, and the empty
+            # `cwd` (with PYTHONSAFEPATH in the env) keeps the current directory off sys.path[0],
+            # so a stdlib-shadowing file in the scanned tree cannot be imported before the worker
+            # pins sys.path from the request.
             [sys.executable, "-S", "-m", "apidrift.worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,  # suppress any import-time stdout from the package
             stderr=subprocess.DEVNULL,  # ...and stderr (warnings) — never leak to the parent
+            cwd=cwd_dir,
             env=_worker_env(),
         )
         try:
@@ -125,6 +138,8 @@ def _run_worker(root: str, fqnames: list[str], timeout: float) -> dict[str, Intr
         if result_path is not None:
             with contextlib.suppress(OSError):
                 result_path.unlink()
+        if cwd_dir is not None:
+            shutil.rmtree(cwd_dir, ignore_errors=True)
 
 
 def _worker_env() -> dict[str, str]:
@@ -145,6 +160,11 @@ def _worker_env() -> dict[str, str]:
     bootstrap = str(Path(apidrift.__file__).resolve().parent.parent)
     env = dict(os.environ)
     env["PYTHONPATH"] = bootstrap
+    # PYTHONSAFEPATH (3.11+) drops the automatic current-directory / script-dir entry from
+    # sys.path[0] entirely, so even the empty spawn cwd cannot become an import vector; it is
+    # ignored on 3.10, where the empty-cwd spawn is the cross-version guarantee. The bootstrap
+    # PYTHONPATH above is a separate, explicit entry and is unaffected.
+    env["PYTHONSAFEPATH"] = "1"
     return env
 
 

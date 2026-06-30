@@ -106,6 +106,23 @@ def test_unreadable_file_does_not_abort_run(
     assert "pandas.read_exel not found" in out
 
 
+def test_deeply_nested_file_does_not_abort_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A pathologically deep file makes ast.parse raise MemoryError/RecursionError (not
+    # SyntaxError). It must be skipped like any other bad file, not abort the run: the good
+    # file is still scanned and its drift reported, and the exit reflects the real finding.
+    # (deep.py sorts before good.py, so the bad parse is hit FIRST.)
+    (tmp_path / "deep.py").write_text("-" * 50_000 + "1\n", encoding="utf-8")
+    (tmp_path / "good.py").write_text(
+        "import pandas as pd\npd.read_exel('x')\n", encoding="utf-8"
+    )
+    code = main([str(tmp_path), "--no-cache"])
+    out = capsys.readouterr().out
+    assert code == 1  # the real drift gates CI; the deep file did not crash the run
+    assert "pandas.read_exel not found" in out
+
+
 def test_verbose_surfaces_unreadable_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

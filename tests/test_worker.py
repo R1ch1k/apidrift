@@ -15,8 +15,10 @@ package on ``sys.path`` so the worker actually imports it.
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -86,7 +88,7 @@ def test_one_bad_root_does_not_sink_a_clean_root(
 
 
 # --------------------------------------------------------------------------- #
-# Output isolation (Codex #7) — an import-time print must not pollute --json
+# Output isolation — an import-time print must not pollute --json
 # --------------------------------------------------------------------------- #
 def test_print_on_import_keeps_json_pure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -125,8 +127,8 @@ def test_sys_exit_package_does_not_abort_cli_run(
 
 
 # --------------------------------------------------------------------------- #
-# FIX 2 — imported code cannot forge the worker's result by monkeypatching the
-# serialization / file-write path on import.
+# Forgery resistance — imported code cannot forge the worker's result by monkeypatching
+# the serialization / file-write path on import.
 # --------------------------------------------------------------------------- #
 def test_import_time_write_text_patch_cannot_forge_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -153,7 +155,7 @@ def test_import_time_write_text_patch_cannot_forge_result(
 
 
 # --------------------------------------------------------------------------- #
-# FIX 3 — an unusable temp directory must not crash before the fail-safe.
+# Temp-dir failure — an unusable temp directory must not crash before the fail-safe.
 # --------------------------------------------------------------------------- #
 def test_missing_tempdir_is_unverifiable_not_a_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -165,29 +167,43 @@ def test_missing_tempdir_is_unverifiable_not_a_crash(
     assert records[("pandas", "pandas.read_csv")].status == "unverifiable"
 
 
+def test_failing_mkdtemp_is_unverifiable_not_a_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Creating the empty spawn-cwd directory is inside the fail-safe too: if mkdtemp fails (a bad
+    # TMPDIR / OS error), the batch degrades to unverifiable (silent), the same rule as mkstemp —
+    # never a crash before the guard, and the already-created result file is still cleaned up.
+    def boom(*args: object, **kwargs: object) -> str:
+        raise OSError("no temp dir")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", boom)
+    records = introspect_batch([("pandas", "pandas.read_csv")])
+    assert records[("pandas", "pandas.read_csv")].status == "unverifiable"
+
+
 # --------------------------------------------------------------------------- #
-# FIX 2 (re-audit) — launch with -S + a controlled bootstrap path, so nothing of the
-# project's runs before the worker binds its primitives, without breaking real resolution.
+# Hardened startup — launch with -S + an empty cwd + a controlled bootstrap path, so nothing
+# of the project's runs before the worker binds its primitives, without breaking real resolution.
 # --------------------------------------------------------------------------- #
 def test_worker_launched_with_dash_S_and_controlled_path(monkeypatch: pytest.MonkeyPatch) -> None:
     import apidrift
-    from apidrift import worker as worker_mod
 
-    captured: dict[str, object] = {}
-    real_popen = worker_mod.subprocess.Popen
+    captured: dict[str, Any] = {}
+    real_popen = subprocess.Popen
 
-    def spy_popen(args: object, **kwargs: object) -> object:
-        captured["args"] = list(args)  # type: ignore[call-overload]
+    def spy_popen(args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        captured["args"] = list(args)
         captured["env"] = kwargs.get("env")
-        return real_popen(args, **kwargs)  # type: ignore[arg-type]
+        captured["cwd"] = kwargs.get("cwd")
+        return real_popen(args, **kwargs)
 
-    monkeypatch.setattr(worker_mod.subprocess, "Popen", spy_popen)
+    monkeypatch.setattr(subprocess, "Popen", spy_popen)
     records = introspect_batch([("pandas", "pandas.read_csv")])
 
     assert records[("pandas", "pandas.read_csv")].status == "resolved"  # real resolution intact
-    assert "-S" in captured["args"]  # type: ignore[operator]
+    assert "-S" in captured["args"]
     bootstrap = str(Path(apidrift.__file__).resolve().parent.parent)
-    assert captured["env"]["PYTHONPATH"] == bootstrap  # type: ignore[index]  # controlled, not full
+    assert captured["env"]["PYTHONPATH"] == bootstrap  # controlled, not the full PYTHONPATH
+    assert captured["env"]["PYTHONSAFEPATH"] == "1"  # cwd/script-dir dropped on 3.11+
+    assert captured["cwd"] is not None  # spawned in an empty dir, never the scanned cwd
 
 
 def test_dash_S_does_not_run_project_sitecustomize(
@@ -205,3 +221,24 @@ def test_dash_S_does_not_run_project_sitecustomize(
     records = introspect_batch([("sitec_victim_zzz", "sitec_victim_zzz.go")])
     assert records[("sitec_victim_zzz", "sitec_victim_zzz.go")].status == "resolved"
     assert not marker.exists()  # sitecustomize did NOT run before the worker
+
+
+# --------------------------------------------------------------------------- #
+# Scanned-dir module shadow — a file in the working directory that shadows a stdlib module
+# the worker imports at startup must NOT execute. `python -m` puts the cwd first on sys.path
+# and `-S` does not remove it; spawning the worker in a fresh empty cwd closes that vector.
+# --------------------------------------------------------------------------- #
+def test_scanned_dir_module_shadow_does_not_execute_in_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A planted json.py (a stdlib name the worker imports) writes a sentinel on import. With the
+    # parent's cwd set to this directory, an un-hardened spawn would import it during the worker's
+    # startup and run it. The worker is launched in a fresh empty cwd (+ PYTHONSAFEPATH), so the
+    # shadow is never on its import path: the sentinel stays unwritten and the real package still
+    # resolves.
+    sentinel = tmp_path / "pwned.txt"
+    (tmp_path / "json.py").write_text(f"open({str(sentinel)!r}, 'w').close()\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    records = introspect_batch([("pandas", "pandas.read_csv")])
+    assert not sentinel.exists()  # the shadowing json.py was never imported by the worker
+    assert records[("pandas", "pandas.read_csv")].status == "resolved"  # resolution intact

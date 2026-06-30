@@ -27,7 +27,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["ruff", "mypy", "pytest"]
+# Pinned so a fresh `pip install -e .[dev]` and CI run the SAME lint/type/test versions this
+# repo is verified green against — a silent tool bump can't turn the build red unseen.
+dev = ["ruff==0.15.8", "mypy==1.20.0", "pytest==9.0.2"]
 # Pinned libraries the benchmark-validation set (tests/test_benchmark.py) was verified
 # against; install with `pip install -e .[bench]` to reproduce the validated case count.
 bench = ["pandas==2.3.3", "scikit-learn==1.8.0"]

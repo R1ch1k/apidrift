@@ -25,9 +25,16 @@ one per root package, hardened to be robust against a package that misbehaves on
   degrades that one package to `unverifiable` instead of taking the run down;
 - **stdout and stderr routed to the null device** — an import-time `print` or warning can never
   leak into apidrift's output (so `--json` stays a single clean document);
-- **`-S` launch with a controlled bootstrap path** — the worker starts with `site` /
-  `sitecustomize` / `.pth` auto-run disabled and only the path needed to import apidrift, then
-  pins `sys.path` from the request; nothing from the project runs before the worker is ready;
+- **a hardened startup that closes the working-directory shadow vector** — the worker is
+  launched with `-S` (no `site` / `sitecustomize` / `.pth` auto-run), from a freshly-created
+  **empty working directory**, with `PYTHONSAFEPATH=1`, and on only the path needed to import
+  apidrift itself. `python -m` would otherwise put the current directory first on `sys.path`
+  (and `-S` does not remove it), so a file in the directory apidrift is run from — for the
+  GitHub Action, the checked-out repo it scans — that shadows a stdlib name the worker imports
+  (e.g. a `json.py`) could execute during startup. The empty cwd closes this on every supported
+  version; `PYTHONSAFEPATH` drops that automatic path entry entirely on 3.11+. The worker then
+  pins `sys.path` from the request for faithful resolution. This hardens one concrete startup
+  vector — it is not a sandbox against a deliberately hostile package (see below);
 - the result is serialized and written through references the worker **binds before importing**
   any target package, so ordinary import-time monkeypatching of the serialization path does not
   silently corrupt a verdict.

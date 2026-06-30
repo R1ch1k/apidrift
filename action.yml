@@ -20,4 +20,9 @@ runs:
       run: pip install "${{ github.action_path }}"
     - name: Run apidrift
       shell: bash
-      run: apidrift ${{ inputs.paths }}
+      # Pass the input through the environment, never templated straight into the script: a
+      # `${{ inputs.paths }}` splice would let untrusted input inject shell commands. Unquoted
+      # `$APIDRIFT_PATHS` still word-splits multiple paths / globs but cannot inject.
+      env:
+        APIDRIFT_PATHS: ${{ inputs.paths }}
+      run: apidrift $APIDRIFT_PATHS

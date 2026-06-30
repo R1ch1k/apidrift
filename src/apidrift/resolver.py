@@ -424,11 +424,21 @@ def _local_shadowed_roots(path: str, table: ImportTable) -> frozenset[str]:
 
 
 def resolve_source(source: str, path: str = "<unknown>") -> FileResolution:
-    """Parse and resolve a source string. Syntax errors are captured, not raised."""
+    """Parse and resolve a source string. A bad parse is captured, never raised.
+
+    ``ast.parse`` raises more than ``SyntaxError`` on pathological input: deep nesting overflows
+    the parser stack (``RecursionError`` / ``MemoryError`` "Parser stack overflowed"), and a NUL
+    byte in the source is a ``ValueError`` before 3.12 (a ``SyntaxError`` from 3.12 on). None of
+    these may abort the run — the same broad-catch-to-silent rule as :func:`resolve_file`'s read
+    guard. ``SyntaxError`` is still surfaced as a ``syntax_error``; the rest degrade the one file
+    to a captured ``read_error`` (silent).
+    """
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
         return _empty_resolution(path, syntax_error=exc)
+    except (ValueError, RecursionError, MemoryError) as exc:
+        return _empty_resolution(path, read_error=f"{type(exc).__name__}: {exc}")
     table = build_import_table(tree)
     resolved, skipped = resolve_calls(tree, table, _local_shadowed_roots(path, table))
     return FileResolution(

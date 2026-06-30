@@ -37,7 +37,10 @@ def collect_python_files(paths: Sequence[str]) -> list[Path]:
 
     for raw in paths:
         if any(ch in raw for ch in _GLOB_CHARS):
-            candidates = [Path(match) for match in glob.glob(raw, recursive=True)]
+            # sorted(): glob.glob returns filesystem order, which varies across machines —
+            # sort it so a glob argument produces the same output order everywhere (directory
+            # walks below are already sorted). Keeps the "deterministic" guarantee unqualified.
+            candidates = [Path(match) for match in sorted(glob.glob(raw, recursive=True))]
         else:
             path = Path(raw)
             candidates = sorted(path.rglob("*.py")) if path.is_dir() else [path]

@@ -167,6 +167,10 @@ jobs:
 
 The step fails the build on errors and passes on a clean (or notices-only) run.
 
+> **Pin by commit SHA for supply-chain safety.** `@v0.0.1` is a mutable tag that can be moved
+> to point at different code. For a tamper-evident pin, reference the action by its full commit
+> SHA instead — e.g. `uses: R1ch1k/apidrift@<commit-sha>` — and let Dependabot bump it.
+
 ## What apidrift deliberately does *not* flag
 
 Precision is the whole adoption story, so silence is a feature — and a linter that documents its
