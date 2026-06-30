@@ -56,6 +56,13 @@ Full sandbox isolation against hostile packages (e.g. a restricted, capability-l
 environment for the worker) is possible **future** hardening. It is not a guarantee apidrift
 makes today, and it is not a launch gate.
 
+## Known limitations
+
+- **Editable installs.** Packages installed via editable installs (`pip install -e`) or `.pth`
+  import hooks may be reported as `unverifiable` rather than checked, because the isolated worker
+  uses a hardened startup (`-S`) that does not replay those `.pth`-based hooks. This is sound
+  silence — such packages are never falsely flagged — but they are not checked.
+
 ## Reporting
 
 If you find a soundness bug — in particular a **false positive** (apidrift flags valid code) or
