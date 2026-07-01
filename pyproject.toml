@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "apidrift"
-version = "0.0.1"
+version = "0.0.2"
 description = "CI guard that flags API calls missing from the dependency version actually installed."
 readme = "README.md"
 requires-python = ">=3.10"

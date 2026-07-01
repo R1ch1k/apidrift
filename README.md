@@ -135,7 +135,7 @@ apidrift src --json
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/R1ch1k/apidrift
-    rev: v0.0.1
+    rev: v0.0.2
     hooks:
       - id: apidrift
 ```
@@ -160,14 +160,14 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install -r requirements.txt   # install YOUR project's deps so apidrift can introspect them
-      - uses: R1ch1k/apidrift@v0.0.1           # this step installs and runs apidrift itself
+      - uses: R1ch1k/apidrift@v0.0.2           # this step installs and runs apidrift itself
         with:
           paths: "src tests"
 ```
 
 The step fails the build on errors and passes on a clean (or notices-only) run.
 
-> **Pin by commit SHA for supply-chain safety.** `@v0.0.1` is a mutable tag that can be moved
+> **Pin by commit SHA for supply-chain safety.** `@v0.0.2` is a mutable tag that can be moved
 > to point at different code. For a tamper-evident pin, reference the action by its full commit
 > SHA instead — e.g. `uses: R1ch1k/apidrift@<commit-sha>` — and let Dependabot bump it.
 
