@@ -159,8 +159,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - run: pip install -e .            # install YOUR deps so apidrift can introspect them
-      - uses: R1ch1k/apidrift@v0.0.1
+      - run: pip install -r requirements.txt   # install YOUR project's deps so apidrift can introspect them
+      - uses: R1ch1k/apidrift@v0.0.1           # this step installs and runs apidrift itself
         with:
           paths: "src tests"
 ```

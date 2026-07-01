@@ -27,6 +27,11 @@ env/
 .DS_Store
 Thumbs.db
 
+# Agent / assistant tooling scratch dirs — never part of the public project.
+.agents/
+.codex/
+.claude/
+
 # Local working notes / internal design docs — kept out so history is public-ready.
 # (Remove a line below to start versioning that file.)
 HANDOFF.md
