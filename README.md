@@ -5,7 +5,7 @@
 **Type-checkers check types against stubs; apidrift checks existence and version-validity
 against your actually-installed package.** Deterministic, zero network, $0.
 
-<!-- DEMO GIF: replace with examples/demo.gif once recorded -->
+![apidrift flagging four version-drift bugs in an example file](examples/demo.gif)
 
 ```text
 $ apidrift examples/ai_generated.py
