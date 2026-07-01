@@ -22,9 +22,10 @@ jobs:
       - run: ruff check .
       - run: mypy
 
-  # Full suite + benchmark on one modern pinned interpreter. The benchmark needs pinned
-  # pandas / scikit-learn to be meaningful but only needs a single interpreter to prove the
-  # property, so this avoids a wheel-availability failure on an older Python with no added signal.
+  # Full suite + benchmark on one modern pinned interpreter. `bench` pins pandas / scikit-learn
+  # for the benchmark; `test` pins the packages the unit tests anchor on (numpy / openai /
+  # requests) so a clean runner reproduces the verified env instead of the maintainer's local one.
+  # One interpreter is enough to prove the property and avoids older-Python wheel-availability risk.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -32,5 +33,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install -e ".[dev,bench]"
+      - run: pip install -e ".[dev,bench,test]"
       - run: pytest

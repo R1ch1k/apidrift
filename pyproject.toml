@@ -33,6 +33,13 @@ dev = ["ruff==0.15.8", "mypy==1.20.0", "pytest==9.0.2"]
 # Pinned libraries the benchmark-validation set (tests/test_benchmark.py) was verified
 # against; install with `pip install -e .[bench]` to reproduce the validated case count.
 bench = ["pandas==2.3.3", "scikit-learn==1.8.0"]
+# Third-party packages the UNIT tests anchor on for real introspection behavior, pinned to the
+# versions that behavior was verified against. A floating (or absent) version silently changes a
+# callable's signature/attributes and breaks an anchor — e.g. numpy.array gained an introspectable
+# signature after 2.2.x (see tests/test_checks.py::test_no_signature_callable_is_silent), and an
+# uninstalled openai/requests makes a silence assertion pass vacuously. CI installs this so a clean
+# runner reproduces the verified environment, not the maintainer's local one.
+test = ["openai==1.56.0", "numpy==2.2.3", "requests==2.32.5"]
 
 [project.scripts]
 apidrift = "apidrift.cli:main"

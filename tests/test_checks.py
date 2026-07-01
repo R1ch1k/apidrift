@@ -156,7 +156,12 @@ def test_var_keyword_target_is_silent() -> None:
 
 
 def test_no_signature_callable_is_silent() -> None:
-    # numpy.array is a C-extension callable; inspect.signature() raises -> silent.
+    # Invariant under test: a callable whose signature cannot be introspected -> Check B stays
+    # silent (no keyword can be judged). Anchored on numpy.array as shipped in numpy 2.2.3 (pinned
+    # via the `test` extra), where array is a C-extension callable inspect.signature() cannot read.
+    # This is version-SPECIFIC, not a general fact about numpy.array: later numpy (>=2.5) gives
+    # array an introspectable signature, and apidrift then CORRECTLY flags `bogus_kw` as an invalid
+    # keyword (a true positive) — which is why the anchor version is pinned rather than floated.
     assert _kw_violations("import numpy\nnumpy.array([1], bogus_kw=2)\n") == []
 
 
